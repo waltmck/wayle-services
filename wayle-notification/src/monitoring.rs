@@ -211,6 +211,12 @@ async fn handle_notification_removed(
 
     let mut notif_list = notifications.get();
     let prev_len = notif_list.len();
+    // Capture the owner before removing the notification from the list, so the close
+    // signal can be directed to the creating connection.
+    let owner = notif_list
+        .iter()
+        .find(|notif| notif.id == id)
+        .and_then(|notif| notif.owner.clone());
     notif_list.retain(|notif| notif.id != id);
 
     if notif_list.len() == prev_len {
@@ -223,10 +229,16 @@ async fn handle_notification_removed(
         let _ = store.remove(id);
     };
 
+    // Direct the close signal to the owning connection only; skip if unknown, for the
+    // same reason as ActionInvoked (a broadcast reaches clients that don't filter by id).
+    let Some(owner) = owner else {
+        return;
+    };
+
     debug!(id = id, ?reason, "emitting NotificationClosed");
     if let Err(err) = connection
         .emit_signal(
-            None::<()>,
+            Some(owner.as_str()),
             SERVICE_PATH,
             SERVICE_INTERFACE,
             Signal::NotificationClosed.as_str(),
