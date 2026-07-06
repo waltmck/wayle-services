@@ -7,7 +7,7 @@ use std::{
 
 use chrono::{DateTime, Utc};
 use derive_more::Debug;
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use tracing::{debug, instrument, warn};
 use zbus::zvariant::{OwnedValue, Str};
 
@@ -32,6 +32,7 @@ pub(crate) struct StoredNotification {
     pub image_path: Option<String>,
     pub expire_timeout: Option<u32>,
     pub timestamp: i64,
+    pub owner: Option<String>,
 }
 
 impl From<&Notification> for StoredNotification {
@@ -48,6 +49,7 @@ impl From<&Notification> for StoredNotification {
             image_path: notification.image_path.get().clone(),
             expire_timeout: notification.expire_timeout.get(),
             timestamp: notification.timestamp.get().timestamp_millis(),
+            owner: notification.owner.clone(),
         }
     }
 }
@@ -86,11 +88,53 @@ impl NotificationStore {
                     hints TEXT NOT NULL,
                     expire_timeout INTEGER,
                     timestamp INTEGER NOT NULL,
-                    image_path TEXT
+                    image_path TEXT,
+                    owner TEXT
                 )",
                 [],
             )
             .map_err(|err| Error::DatabaseError(format!("cannot create table: {err}")))?;
+
+        // Migrate pre-existing databases that lack the `owner` column (CREATE TABLE IF
+        // NOT EXISTS won't add it, and SQLite has no ADD COLUMN IF NOT EXISTS).
+        let has_owner_column = {
+            let mut stmt = connection
+                .prepare("PRAGMA table_info(notifications)")
+                .map_err(|err| Error::DatabaseError(format!("cannot inspect schema: {err}")))?;
+            let columns = stmt
+                .query_map([], |row| row.get::<_, String>(1))
+                .map_err(|err| Error::DatabaseError(format!("cannot read schema: {err}")))?;
+            columns
+                .filter_map(Result::ok)
+                .any(|column| column == "owner")
+        };
+        if !has_owner_column {
+            connection
+                .execute("ALTER TABLE notifications ADD COLUMN owner TEXT", [])
+                .map_err(|err| Error::DatabaseError(format!("cannot add owner column: {err}")))?;
+        }
+
+        connection
+            .execute(
+                "CREATE TABLE IF NOT EXISTS metadata (
+                    key TEXT PRIMARY KEY,
+                    value INTEGER NOT NULL
+                )",
+                [],
+            )
+            .map_err(|err| Error::DatabaseError(format!("cannot create metadata table: {err}")))?;
+
+        connection
+            .execute(
+                "CREATE TABLE IF NOT EXISTS metadata_text (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                )",
+                [],
+            )
+            .map_err(|err| {
+                Error::DatabaseError(format!("cannot create metadata_text table: {err}"))
+            })?;
 
         connection
             .execute_batch(
@@ -102,6 +146,80 @@ impl NotificationStore {
         Ok(Self {
             connection: Arc::new(Mutex::new(connection)),
         })
+    }
+
+    /// Highest notification id ever issued.
+    ///
+    /// Persisted so the id counter can resume above it after a restart instead of
+    /// rewinding to the max surviving notification — a rewind reuses ids that
+    /// long-lived clients still hold, so an action invoked on a new notification
+    /// would reach the wrong, stale client.
+    #[instrument(skip(self), err)]
+    pub fn id_high_water(&self) -> Result<u32, Error> {
+        let conn = self
+            .connection
+            .lock()
+            .map_err(|_| Error::DatabaseError("cannot acquire lock on database".to_string()))?;
+        let value: Option<u32> = conn
+            .query_row(
+                "SELECT value FROM metadata WHERE key = 'id_high_water'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|err| Error::DatabaseError(format!("cannot read id high-water: {err}")))?;
+        Ok(value.unwrap_or(0))
+    }
+
+    /// Records `id` as issued, advancing the persisted high-water mark if higher.
+    #[instrument(skip(self), err)]
+    pub fn record_id_high_water(&self, id: u32) -> Result<(), Error> {
+        self.connection
+            .lock()
+            .map_err(|_| Error::DatabaseError("cannot acquire lock on database".to_string()))?
+            .execute(
+                "INSERT INTO metadata (key, value) VALUES ('id_high_water', ?1)
+                 ON CONFLICT(key) DO UPDATE SET value = MAX(value, excluded.value)",
+                params![id],
+            )
+            .map_err(|err| Error::DatabaseError(format!("cannot record id high-water: {err}")))?;
+        Ok(())
+    }
+
+    /// The session bus GUID recorded when notifications were last persisted, if any.
+    ///
+    /// Owner unique names are only meaningful within one session bus lifetime, so a
+    /// mismatch means the persisted owners are stale and must not be directed to.
+    #[instrument(skip(self), err)]
+    pub fn bus_guid(&self) -> Result<Option<String>, Error> {
+        let conn = self
+            .connection
+            .lock()
+            .map_err(|_| Error::DatabaseError("cannot acquire lock on database".to_string()))?;
+        let value: Option<String> = conn
+            .query_row(
+                "SELECT value FROM metadata_text WHERE key = 'bus_guid'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|err| Error::DatabaseError(format!("cannot read bus guid: {err}")))?;
+        Ok(value)
+    }
+
+    /// Records the current session bus GUID.
+    #[instrument(skip(self), err)]
+    pub fn record_bus_guid(&self, guid: &str) -> Result<(), Error> {
+        self.connection
+            .lock()
+            .map_err(|_| Error::DatabaseError("cannot acquire lock on database".to_string()))?
+            .execute(
+                "INSERT INTO metadata_text (key, value) VALUES ('bus_guid', ?1)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                params![guid],
+            )
+            .map_err(|err| Error::DatabaseError(format!("cannot record bus guid: {err}")))?;
+        Ok(())
     }
 
     #[instrument(skip(self, notification), fields(id = notification.id, summary = %notification.summary.get()), err)]
@@ -124,8 +242,8 @@ impl NotificationStore {
             .execute(
                 "INSERT OR REPLACE INTO notifications
                  (id, app_name, replaces_id, app_icon, summary, body, actions, hints,
-                 expire_timeout, timestamp, image_path)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                 expire_timeout, timestamp, image_path, owner)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
                 params![
                     stored.id,
                     stored.app_name,
@@ -138,6 +256,7 @@ impl NotificationStore {
                     stored.expire_timeout,
                     stored.timestamp,
                     stored.image_path,
+                    stored.owner,
                 ],
             )
             .map_err(|err| Error::DatabaseError(format!("cannot store notification: {err}")))?;
@@ -165,7 +284,7 @@ impl NotificationStore {
         let mut stmt = conn
             .prepare(
                 "SELECT id, app_name, replaces_id, app_icon, summary, body,
-                 actions, hints, expire_timeout, timestamp, image_path
+                 actions, hints, expire_timeout, timestamp, image_path, owner
                  FROM notifications
                  ORDER BY timestamp DESC",
             )
@@ -215,6 +334,7 @@ impl NotificationStore {
                     image_path,
                     expire_timeout: row.get(8)?,
                     timestamp: row.get(9)?,
+                    owner: row.get(11)?,
                 })
             })
             .map_err(|err| Error::DatabaseError(format!("cannot query notifications: {err}")))?

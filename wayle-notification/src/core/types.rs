@@ -16,6 +16,8 @@ pub(crate) struct NotificationProps {
     pub hints: HashMap<String, OwnedValue>,
     pub expire_timeout: i32,
     pub timestamp: DateTime<Utc>,
+    /// Unique D-Bus name of the connection that created this notification.
+    pub owner: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy)]

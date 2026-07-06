@@ -9,7 +9,7 @@ use std::{
 use chrono::Utc;
 use derive_more::Debug;
 use tokio::sync::broadcast;
-use tracing::{debug, instrument};
+use tracing::{debug, instrument, warn};
 use wayle_core::Property;
 use zbus::{
     Connection, fdo,
@@ -23,12 +23,15 @@ use crate::{
     },
     events::NotificationEvent,
     glob, image_cache,
+    persistence::NotificationStore,
     types::{Capabilities, ClosedReason, Name, SpecVersion, Vendor, Version},
 };
 
 #[derive(Debug)]
 pub(crate) struct NotificationDaemon {
     pub counter: AtomicU32,
+    #[debug(skip)]
+    pub store: Option<NotificationStore>,
     #[debug(skip)]
     pub zbus_connection: Connection,
     #[debug(skip)]
@@ -43,7 +46,7 @@ pub(crate) struct NotificationDaemon {
 impl NotificationDaemon {
     #[allow(clippy::too_many_arguments)]
     #[instrument(
-        skip(self, actions, hints),
+        skip(self, actions, hints, header),
         fields(
             app = %app_name,
             replaces = %replaces_id,
@@ -52,6 +55,7 @@ impl NotificationDaemon {
     )]
     pub fn notify(
         &self,
+        #[zbus(header)] header: zbus::message::Header<'_>,
         app_name: String,
         replaces_id: u32,
         app_icon: String,
@@ -76,6 +80,7 @@ impl NotificationDaemon {
 
         let hints = normalize_hints(hints);
         self.register_owner(id, &app_name);
+        let owner = header.sender().map(|sender| sender.to_string());
 
         let notif = Notification::new(
             NotificationProps {
@@ -89,6 +94,7 @@ impl NotificationDaemon {
                 hints,
                 expire_timeout,
                 timestamp: Utc::now(),
+                owner,
             },
             self.zbus_connection.clone(),
             self.notif_tx.clone(),
@@ -130,11 +136,24 @@ impl NotificationDaemon {
 }
 
 impl NotificationDaemon {
+    /// Issues a fresh, never-before-used notification id and records it as the
+    /// persisted high-water mark, so the counter never rewinds across a restart
+    /// (reusing an id would let an action reach a stale, still-running client).
+    fn next_id(&self) -> u32 {
+        let new_id = self.counter.fetch_add(1, Ordering::Relaxed);
+        if let Some(store) = &self.store
+            && let Err(err) = store.record_id_high_water(new_id)
+        {
+            warn!(new_id, error = %err, "cannot persist notification id high-water mark");
+        }
+        new_id
+    }
+
     /// Only allows an app to reuse `replaces_id` values it owns.
     /// Assigns a new ID otherwise.
     fn resolve_id(&self, replaces_id: u32, app_name: &str) -> u32 {
         if replaces_id == 0 {
-            let new_id = self.counter.fetch_add(1, Ordering::Relaxed);
+            let new_id = self.next_id();
             debug!(new_id, "assigned new notification id");
             return new_id;
         }
@@ -150,7 +169,7 @@ impl NotificationDaemon {
             debug!(replaces_id, "reusing replaces_id owned by same app");
             replaces_id
         } else {
-            let new_id = self.counter.fetch_add(1, Ordering::Relaxed);
+            let new_id = self.next_id();
             debug!(
                 replaces_id,
                 new_id, "replaces_id belongs to different app, assigned new id"

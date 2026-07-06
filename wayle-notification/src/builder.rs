@@ -6,7 +6,7 @@ use std::{
 use chrono::{DateTime, Utc};
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use wayle_core::Property;
 use wayle_traits::ServiceMonitoring;
 use zbus::{Connection, object_server::Interface};
@@ -112,13 +112,56 @@ impl NotificationServiceBuilder {
         let cancellation_token = CancellationToken::new();
 
         let store = init_store();
-        let stored_notifications =
-            load_stored_notifications(&store, self.remove_expired.get(), &connection, &notif_tx);
+
+        // Owner unique names are only valid within a single session bus lifetime.
+        // Compare the current bus GUID to the one recorded with the persisted
+        // notifications; if they differ (or can't be determined), the restored owners
+        // are from a prior session and must not be used to direct signals.
+        let current_bus_guid = match zbus::fdo::DBusProxy::new(&connection).await {
+            Ok(proxy) => match proxy.get_id().await {
+                Ok(guid) => Some(guid.to_string()),
+                Err(err) => {
+                    warn!(error = %err, "cannot read session bus GUID; treating persisted owners as stale");
+                    None
+                }
+            },
+            Err(err) => {
+                warn!(error = %err, "cannot create DBus proxy; treating persisted owners as stale");
+                None
+            }
+        };
+        let stored_bus_guid = store
+            .as_ref()
+            .and_then(|store| store.bus_guid().ok().flatten());
+        let same_session = current_bus_guid.is_some() && current_bus_guid == stored_bus_guid;
+
+        let stored_notifications = load_stored_notifications(
+            &store,
+            self.remove_expired.get(),
+            &connection,
+            &notif_tx,
+            same_session,
+        );
+
+        if let (Some(store), Some(guid)) = (store.as_ref(), current_bus_guid.as_ref())
+            && let Err(err) = store.record_bus_guid(guid)
+        {
+            warn!(error = %err, "cannot record session bus GUID");
+        }
         let max_id = stored_notifications
             .iter()
             .map(|notif| notif.id)
             .max()
             .unwrap_or(0);
+        // Resume the id counter above the highest id ever issued, not just the max
+        // surviving notification. Transient/dismissed notifications had ids handed to
+        // long-lived clients; if the counter rewound below them and reissued one, an
+        // action invoked on the new notification would reach the wrong, stale client.
+        let high_water = store
+            .as_ref()
+            .and_then(|store| store.id_high_water().ok())
+            .unwrap_or(0);
+        let counter_start = max_id.max(high_water).saturating_add(1);
 
         let mut initial_owners = HashMap::new();
         for notification in &stored_notifications {
@@ -128,7 +171,8 @@ impl NotificationServiceBuilder {
         }
 
         let freedesktop_daemon = NotificationDaemon {
-            counter: AtomicU32::new(max_id + 1),
+            counter: AtomicU32::new(counter_start),
+            store: store.clone(),
             zbus_connection: connection.clone(),
             notif_tx: notif_tx.clone(),
             blocklist: self.blocklist.clone(),
@@ -190,6 +234,7 @@ fn load_stored_notifications(
     remove_expired: bool,
     connection: &Connection,
     notif_tx: &broadcast::Sender<NotificationEvent>,
+    keep_owners: bool,
 ) -> Vec<Arc<Notification>> {
     store
         .as_ref()
@@ -198,7 +243,12 @@ fn load_stored_notifications(
             stored
                 .into_iter()
                 .map(|notification| {
-                    stored_to_notification(notification, connection.clone(), notif_tx.clone())
+                    stored_to_notification(
+                        notification,
+                        connection.clone(),
+                        notif_tx.clone(),
+                        keep_owners,
+                    )
                 })
                 .collect()
         })
@@ -209,6 +259,7 @@ fn stored_to_notification(
     stored: StoredNotification,
     connection: Connection,
     notif_tx: broadcast::Sender<NotificationEvent>,
+    keep_owner: bool,
 ) -> Arc<Notification> {
     Arc::new(Notification::new(
         NotificationProps {
@@ -223,6 +274,7 @@ fn stored_to_notification(
             expire_timeout: stored.expire_timeout.unwrap_or(0) as i32,
             timestamp: DateTime::<Utc>::from_timestamp_millis(stored.timestamp)
                 .unwrap_or_else(Utc::now),
+            owner: if keep_owner { stored.owner } else { None },
         },
         connection,
         notif_tx,

@@ -17,10 +17,18 @@ impl NotificationControls {
         connection: &Connection,
         id: &u32,
         action_key: &str,
+        owner: Option<&str>,
     ) -> Result<(), Error> {
+        // Direct the signal to the notification's owning connection. If the owner is
+        // unknown, skip emission rather than broadcasting: a broadcast lets clients
+        // that don't filter by id react to notifications they didn't create.
+        let Some(owner) = owner else {
+            return Ok(());
+        };
+
         connection
             .emit_signal(
-                None::<()>,
+                Some(owner),
                 SERVICE_PATH,
                 SERVICE_INTERFACE,
                 Signal::ActionInvoked.as_str(),

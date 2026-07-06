@@ -31,6 +31,11 @@ pub struct Notification {
 
     /// The ID of the notification
     pub id: u32,
+    /// Unique D-Bus name of the connection that created this notification, e.g.
+    /// ":1.588". Used to direct the ActionInvoked/NotificationClosed signals to the
+    /// owning client instead of broadcasting them; `None` if unknown (e.g. restored
+    /// from a prior session).
+    pub owner: Option<String>,
     /// The optional name of the application sending the notification. This should be the
     /// application's formal name, rather than some sort of ID. An example would be
     /// "FredApp E-Mail Client," rather than "fredapp-email-client."
@@ -131,7 +136,13 @@ impl Notification {
     /// Returns error if the D-Bus signal emission fails.
     #[instrument(skip(self), fields(notification_id = %self.id, action = %action_key), err)]
     pub async fn invoke(&self, action_key: &str) -> Result<(), Error> {
-        NotificationControls::invoke(&self.zbus_connection, &self.id, action_key).await?;
+        NotificationControls::invoke(
+            &self.zbus_connection,
+            &self.id,
+            action_key,
+            self.owner.as_deref(),
+        )
+        .await?;
         if !self.is_resident.get() {
             let _ = self
                 .notif_tx
@@ -260,6 +271,7 @@ impl Notification {
             zbus_connection: connection.clone(),
             notif_tx,
             id,
+            owner: props.owner,
             app_name: Property::new(app_name),
             app_icon: Property::new(app_icon),
             replaces_id: Property::new(replaces_id),
