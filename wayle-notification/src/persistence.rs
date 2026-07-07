@@ -49,7 +49,7 @@ impl From<&Notification> for StoredNotification {
             image_path: notification.image_path.get().clone(),
             expire_timeout: notification.expire_timeout.get(),
             timestamp: notification.timestamp.get().timestamp_millis(),
-            owner: notification.owner.clone(),
+            owner: notification.owner.get(),
         }
     }
 }

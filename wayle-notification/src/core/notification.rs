@@ -35,7 +35,7 @@ pub struct Notification {
     /// ":1.588". Used to direct the ActionInvoked/NotificationClosed signals to the
     /// owning client instead of broadcasting them; `None` if unknown (e.g. restored
     /// from a prior session).
-    pub owner: Option<String>,
+    pub owner: Property<Option<String>>,
     /// The optional name of the application sending the notification. This should be the
     /// application's formal name, rather than some sort of ID. An example would be
     /// "FredApp E-Mail Client," rather than "fredapp-email-client."
@@ -136,11 +136,12 @@ impl Notification {
     /// Returns error if the D-Bus signal emission fails.
     #[instrument(skip(self), fields(notification_id = %self.id, action = %action_key), err)]
     pub async fn invoke(&self, action_key: &str) -> Result<(), Error> {
+        let owner = self.owner.get();
         NotificationControls::invoke(
             &self.zbus_connection,
             &self.id,
             action_key,
-            self.owner.as_deref(),
+            owner.as_deref(),
         )
         .await?;
         if !self.is_resident.get() {
@@ -149,6 +150,37 @@ impl Notification {
                 .send(NotificationEvent::Remove(self.id, ClosedReason::Closed));
         }
         Ok(())
+    }
+
+    /// Applies `incoming`'s field values onto this notification in place.
+    ///
+    /// Used for `replaces_id` updates so a notification keeps a stable `Arc` identity
+    /// for its whole lifetime and observers react via its `Property` fields, instead of
+    /// the notification being swapped for a fresh object. `id` is the identity, and
+    /// `owner` is set by the caller from the D-Bus sender, so neither is copied here.
+    pub(crate) fn update_from(&self, incoming: &Notification) {
+        self.app_name.set(incoming.app_name.get());
+        self.replaces_id.set(incoming.replaces_id.get());
+        self.app_icon.set(incoming.app_icon.get());
+        self.summary.set(incoming.summary.get());
+        self.body.set(incoming.body.get());
+        self.actions.set(incoming.actions.get());
+        self.default_action.set(incoming.default_action.get());
+        self.hints.set(incoming.hints.get());
+        self.expire_timeout.set(incoming.expire_timeout.get());
+        self.urgency.set(incoming.urgency.get());
+        self.category.set(incoming.category.get());
+        self.timestamp.set(incoming.timestamp.get());
+        self.image_path.set(incoming.image_path.get());
+        self.desktop_entry.set(incoming.desktop_entry.get());
+        self.is_transient.set(incoming.is_transient.get());
+        self.is_resident.set(incoming.is_resident.get());
+        self.sound_file.set(incoming.sound_file.get());
+        self.sound_name.set(incoming.sound_name.get());
+        self.suppress_sound.set(incoming.suppress_sound.get());
+        self.x.set(incoming.x.get());
+        self.y.set(incoming.y.get());
+        self.action_icons.set(incoming.action_icons.get());
     }
 
     #[allow(clippy::too_many_lines)]
@@ -271,7 +303,7 @@ impl Notification {
             zbus_connection: connection.clone(),
             notif_tx,
             id,
-            owner: props.owner,
+            owner: Property::new(props.owner),
             app_name: Property::new(app_name),
             app_icon: Property::new(app_icon),
             replaces_id: Property::new(replaces_id),
