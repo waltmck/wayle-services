@@ -1,11 +1,13 @@
-use std::{sync::Arc, time::Duration};
+use std::{collections::HashSet, sync::Arc, time::Duration};
 
 use chrono::Utc;
+use futures::StreamExt;
 use tokio::sync::broadcast;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, instrument, warn};
 use wayle_core::Property;
 use wayle_traits::ServiceMonitoring;
-use zbus::Connection;
+use zbus::{Connection, fdo::DBusProxy};
 
 use crate::{
     core::notification::Notification,
@@ -85,7 +87,91 @@ async fn handle_notifications(service: &NotificationService) -> Result<(), Error
         }
     });
 
+    spawn_owner_watching(
+        service.notifications.clone(),
+        service.popups.clone(),
+        service.connection.clone(),
+        service.cancellation_token.clone(),
+    );
+
     Ok(())
+}
+
+/// Removes a notification's actions in place so it is no longer clickable.
+///
+/// `default_action` is cleared before `actions` so an observer watching only `actions`
+/// still sees a consistent (action-less) state by the time it reacts.
+fn strip_actions(notif: &Notification) {
+    notif.default_action.set(None);
+    notif.actions.set(vec![]);
+}
+
+/// Reactively strips a notification's actions once its owning D-Bus connection is gone
+/// (the app can no longer service them). Fully signal-driven: subscribe to
+/// `NameOwnerChanged`, seed once from the current bus names, then react to removals.
+/// No polling.
+fn spawn_owner_watching(
+    notifications: Property<Vec<Arc<Notification>>>,
+    popups: Property<Vec<Arc<Notification>>>,
+    connection: Connection,
+    cancellation_token: CancellationToken,
+) {
+    tokio::spawn(async move {
+        let Ok(dbus_proxy) = DBusProxy::new(&connection).await else {
+            warn!("cannot create DBus proxy for notification owner watching");
+            return;
+        };
+
+        // Subscribe before seeding so no disconnect is missed in the gap between them.
+        let Ok(mut name_owner_changed) = dbus_proxy.receive_name_owner_changed().await else {
+            warn!("cannot subscribe to NameOwnerChanged for notification owner watching");
+            return;
+        };
+
+        // Seed: strip notifications/popups whose owner is unknown or no longer on the bus
+        // (restored from a prior session, or an app that exited while we were down).
+        match dbus_proxy.list_names().await {
+            Ok(names) => {
+                let live: HashSet<String> =
+                    names.into_iter().map(|name| name.to_string()).collect();
+                let notifs = notifications.get();
+                let pops = popups.get();
+                for notif in notifs.iter().chain(pops.iter()) {
+                    if !notif.owner.get().is_some_and(|owner| live.contains(&owner)) {
+                        strip_actions(notif);
+                    }
+                }
+            }
+            Err(err) => {
+                warn!(error = %err, "cannot list D-Bus names to reconcile notification owners");
+            }
+        }
+
+        loop {
+            tokio::select! {
+                _ = cancellation_token.cancelled() => return,
+                signal = name_owner_changed.next() => {
+                    let Some(signal) = signal else { return };
+                    let Ok(args) = signal.args() else { continue };
+
+                    let disconnected = args.old_owner().is_some() && args.new_owner().is_none();
+                    if !disconnected {
+                        continue;
+                    }
+
+                    let vanished = args.name().to_string();
+                    let notifs = notifications.get();
+                    let pops = popups.get();
+                    for notif in notifs.iter().chain(pops.iter()) {
+                        if notif.owner.get().as_deref() == Some(vanished.as_str()) {
+                            debug!(id = notif.id, owner = %vanished, "owner disconnected, stripping actions");
+                            strip_actions(notif);
+                        }
+                    }
+                }
+            }
+        }
+    });
 }
 
 fn handle_popup_added(
@@ -99,22 +185,34 @@ fn handle_popup_added(
         return;
     }
 
-    let incoming_popup = Arc::new(incoming_popup.clone());
     let mut list = popups.get();
-    list.retain(|popup| popup != &incoming_popup);
-    list.insert(0, incoming_popup.clone());
+
+    // Stable identity (mirrors the history list): update an existing popup's Property
+    // fields in place instead of replacing its Arc, so the popup card reacts to the
+    // change rather than being left bound to a stale Arc.
+    let popup = match list.iter().find(|popup| popup.id == incoming_popup.id).cloned() {
+        Some(existing) => {
+            existing.update_from(incoming_popup);
+            existing.owner.set(incoming_popup.owner.get());
+            existing
+        }
+        None => Arc::new(incoming_popup.clone()),
+    };
+
+    list.retain(|p| p.id != popup.id);
+    list.insert(0, popup.clone());
     popups.replace(list);
 
     let default_duration = Duration::from_millis(popup_duration.get() as u64);
 
-    match incoming_popup.expire_timeout.get() {
+    match popup.expire_timeout.get() {
         Some(0) => {}
         Some(ttl) => {
             let expire = Duration::from_millis(ttl as u64);
-            popup_timers.start(incoming_popup.id, default_duration.min(expire));
+            popup_timers.start(popup.id, default_duration.min(expire));
         }
         None => {
-            popup_timers.start(incoming_popup.id, default_duration);
+            popup_timers.start(popup.id, default_duration);
         }
     }
 }
@@ -126,38 +224,51 @@ fn handle_notification_added(
     remove_expired: &Property<bool>,
     notif_tx: &broadcast::Sender<NotificationEvent>,
 ) {
+    let mut list = notifications.get();
+
+    // Transient notifications are not kept in history. If a notification is flipped to
+    // transient over an existing id, drop the stale history entry so it leaves history.
     if incoming_notif.is_transient.get() {
+        if list.iter().any(|notif| notif.id == incoming_notif.id) {
+            list.retain(|notif| notif.id != incoming_notif.id);
+            notifications.replace(list);
+            if let Some(store) = store.as_ref() {
+                let _ = store.remove(incoming_notif.id);
+            }
+        }
         return;
     }
 
-    let notif_arc = Arc::new(incoming_notif.clone());
-    let mut list = notifications.get();
+    // Stable identity: update an existing notification in place (observers react via its
+    // Property fields) rather than replacing its Arc; only mint a new Arc for a new id.
+    let notif_arc = match list.iter().find(|notif| notif.id == incoming_notif.id).cloned() {
+        Some(existing) => {
+            existing.update_from(incoming_notif);
+            // Refresh the owning connection (e.g. an app that reconnected and replaced
+            // its own notification) so directed signals reach the live client.
+            existing.owner.set(incoming_notif.owner.get());
+            debug!(
+                id = existing.id,
+                app = ?existing.app_name.get(),
+                "updating existing notification in place"
+            );
+            existing
+        }
+        None => {
+            debug!(
+                id = incoming_notif.id,
+                app = ?incoming_notif.app_name.get(),
+                summary = %incoming_notif.summary.get(),
+                list_size = list.len(),
+                "adding new notification"
+            );
+            Arc::new(incoming_notif.clone())
+        }
+    };
 
-    let replaced = list
-        .iter()
-        .find(|notif| notif.id == notif_arc.id)
-        .map(|notif| (notif.id, notif.app_name.get()));
-    if let Some((replaced_id, replaced_app)) = &replaced {
-        debug!(
-            incoming_id = notif_arc.id,
-            incoming_app = ?notif_arc.app_name.get(),
-            replaced_id,
-            replaced_app = ?replaced_app,
-            "replacing existing notification"
-        );
-    } else {
-        debug!(
-            id = notif_arc.id,
-            app = ?notif_arc.app_name.get(),
-            summary = %notif_arc.summary.get(),
-            list_size = list.len(),
-            "adding new notification"
-        );
-    }
-
+    // Move to (or keep at) the front, preserving the Arc identity.
     list.retain(|notif| notif.id != notif_arc.id);
     list.insert(0, notif_arc.clone());
-
     notifications.replace(list);
 
     if let Some(store) = store.as_ref() {
@@ -216,7 +327,7 @@ async fn handle_notification_removed(
     let owner = notif_list
         .iter()
         .find(|notif| notif.id == id)
-        .and_then(|notif| notif.owner.clone());
+        .and_then(|notif| notif.owner.get());
     notif_list.retain(|notif| notif.id != id);
 
     if notif_list.len() == prev_len {
