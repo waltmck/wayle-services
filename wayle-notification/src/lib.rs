@@ -75,9 +75,11 @@ mod builder;
 /// Notification data structures and operations.
 pub mod core;
 pub(crate) mod daemon;
+pub(crate) mod desktop_entry;
 /// Error types.
 pub mod error;
 pub(crate) mod events;
+pub(crate) mod gtk_daemon;
 mod glob;
 pub(crate) mod image_cache;
 pub(crate) mod monitoring;

@@ -18,6 +18,74 @@ pub(crate) struct NotificationProps {
     pub timestamp: DateTime<Utc>,
     /// Unique D-Bus name of the connection that created this notification.
     pub owner: Option<String>,
+    /// Origin of the notification and how its actions are dispatched.
+    pub source: NotificationSource,
+}
+
+/// Where a notification came from, and how its actions are dispatched.
+///
+/// This is the single abstraction that lets `invoke` and the owner-watching strip
+/// logic treat freedesktop and GTK notifications uniformly: each carries the name its
+/// actions dispatch to, so "strip actions when that target is unreachable" is one rule.
+#[derive(Debug, Clone)]
+pub enum NotificationSource {
+    /// `org.freedesktop.Notifications`. Actions are dispatched via a directed
+    /// `ActionInvoked` signal to the owning connection (`Notification::owner`).
+    Freedesktop,
+    /// `org.gtk.Notifications`. Actions are dispatched via
+    /// `org.freedesktop.Application.ActivateAction`/`Activate`, which cold-launches the
+    /// app via D-Bus activation when it is not running.
+    Gtk(GtkDispatch),
+}
+
+/// Everything needed to dispatch a GTK notification's actions to the owning app.
+#[derive(Debug, Clone)]
+pub struct GtkDispatch {
+    /// The GApplication id (well-known bus name), e.g. `org.gnome.Calendar`.
+    pub app_id: String,
+    /// The app-chosen notification id (the replace/withdraw key).
+    pub gtk_id: String,
+    /// The `default-action` (body click). `None` ⇒ body click calls `Activate` (raise).
+    pub default_action: Option<GtkAction>,
+    /// Button actions, keyed by the `"app."`-prefixed name exposed as the `Action.id`.
+    pub button_actions: HashMap<String, GtkAction>,
+}
+
+/// A single GTK action target: the action name (with the `"app."` prefix stripped, as
+/// `org.freedesktop.Application.ActivateAction` expects) plus its optional parameter.
+#[derive(Debug)]
+pub struct GtkAction {
+    /// Action name with the `"app."` prefix already stripped.
+    pub name: String,
+    /// Optional GVariant parameter for the action.
+    pub target: Option<OwnedValue>,
+}
+
+impl Clone for GtkAction {
+    // `OwnedValue` has no `Clone` (only fallible `try_clone`, because a variant could
+    // carry an fd). Notification action targets are always simple serializable variants,
+    // so this never actually fails; degrade to no-target rather than panic if it ever did.
+    fn clone(&self) -> Self {
+        Self {
+            name: self.name.clone(),
+            target: self.target.as_ref().and_then(|value| value.try_clone().ok()),
+        }
+    }
+}
+
+/// Derives an app's `org.freedesktop.Application` object path from its id, matching
+/// `g_application_get_dbus_object_path`: prefix `/`, then `.`→`/` and `-`→`_`.
+pub(crate) fn gtk_object_path(app_id: &str) -> String {
+    let mut path = String::with_capacity(app_id.len() + 1);
+    path.push('/');
+    for ch in app_id.chars() {
+        match ch {
+            '.' => path.push('/'),
+            '-' => path.push('_'),
+            other => path.push(other),
+        }
+    }
+    path
 }
 
 #[derive(Debug, Clone, Copy)]

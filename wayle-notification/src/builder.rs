@@ -1,6 +1,6 @@
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex, atomic::AtomicU32},
+    sync::{Arc, Mutex},
 };
 
 use chrono::{DateTime, Utc};
@@ -12,14 +12,21 @@ use wayle_traits::ServiceMonitoring;
 use zbus::{Connection, object_server::Interface};
 
 use crate::{
-    core::{notification::Notification, types::NotificationProps},
-    daemon::NotificationDaemon,
+    core::{
+        notification::Notification,
+        types::{NotificationProps, NotificationSource},
+    },
+    daemon::{IdCounter, NotificationDaemon},
     error::Error,
     events::NotificationEvent,
+    gtk_daemon::GtkNotificationsDaemon,
     persistence::{NotificationStore, StoredNotification},
     popup_timer::PopupTimerManager,
     service::NotificationService,
-    types::dbus::{SERVICE_NAME, SERVICE_PATH, WAYLE_SERVICE_NAME, WAYLE_SERVICE_PATH},
+    types::dbus::{
+        GTK_SERVICE_NAME, GTK_SERVICE_PATH, SERVICE_NAME, SERVICE_PATH, WAYLE_SERVICE_NAME,
+        WAYLE_SERVICE_PATH,
+    },
     wayle_daemon::WayleDaemon,
 };
 
@@ -170,9 +177,12 @@ impl NotificationServiceBuilder {
             }
         }
 
+        // Shared by both daemons so freedesktop and GTK notifications never collide on an
+        // id (and both advance the same persisted high-water mark).
+        let id_counter = Arc::new(IdCounter::new(counter_start, store.clone()));
+
         let freedesktop_daemon = NotificationDaemon {
-            counter: AtomicU32::new(counter_start),
-            store: store.clone(),
+            id_counter: Arc::clone(&id_counter),
             zbus_connection: connection.clone(),
             notif_tx: notif_tx.clone(),
             blocklist: self.blocklist.clone(),
@@ -182,6 +192,29 @@ impl NotificationServiceBuilder {
         register_dbus_object(&connection, SERVICE_PATH, freedesktop_daemon).await?;
         register_dbus_name(&connection, SERVICE_NAME).await?;
         info!("Notification daemon registered at {SERVICE_NAME}");
+
+        // GTK notification bridge (`org.gtk.Notifications`) so GApplication/GNotification
+        // apps route here and get persistent, cold-launchable actions. Best-effort: if the
+        // name can't be acquired (e.g. another daemon owns it), log and carry on rather
+        // than failing the whole service.
+        let mut gtk_keys = HashMap::new();
+        for notification in &stored_notifications {
+            if let NotificationSource::Gtk(dispatch) = notification.source.get() {
+                gtk_keys.insert((dispatch.app_id, dispatch.gtk_id), notification.id);
+            }
+        }
+        let gtk_daemon = GtkNotificationsDaemon {
+            id_counter: Arc::clone(&id_counter),
+            zbus_connection: connection.clone(),
+            notif_tx: notif_tx.clone(),
+            blocklist: self.blocklist.clone(),
+            keys: Mutex::new(gtk_keys),
+        };
+        register_dbus_object(&connection, GTK_SERVICE_PATH, gtk_daemon).await?;
+        match register_dbus_name(&connection, GTK_SERVICE_NAME).await {
+            Ok(()) => info!("GTK notification bridge registered at {GTK_SERVICE_NAME}"),
+            Err(err) => warn!(error = %err, "cannot acquire {GTK_SERVICE_NAME}; GTK notifications disabled"),
+        }
 
         let popups = Property::new(vec![]);
         let popup_timers = Arc::new(PopupTimerManager::new(popups.clone()));
@@ -275,6 +308,7 @@ fn stored_to_notification(
             timestamp: DateTime::<Utc>::from_timestamp_millis(stored.timestamp)
                 .unwrap_or_else(Utc::now),
             owner: if keep_owner { stored.owner } else { None },
+            source: stored.source,
         },
         connection,
         notif_tx,
