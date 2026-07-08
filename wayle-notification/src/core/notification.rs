@@ -9,7 +9,7 @@ use zbus::Connection;
 
 use super::{
     controls::NotificationControls,
-    types::{Action, NotificationHints, NotificationProps},
+    types::{Action, NotificationHints, NotificationProps, NotificationSource},
 };
 use crate::{
     error::Error,
@@ -31,6 +31,10 @@ pub struct Notification {
 
     /// The ID of the notification
     pub id: u32,
+    /// Origin of the notification and how its actions are dispatched (freedesktop vs
+    /// GTK). Stored reactively so a replace-in-place refreshes the GTK dispatch data
+    /// (button names/targets) alongside the visible action fields.
+    pub source: Property<NotificationSource>,
     /// Unique D-Bus name of the connection that created this notification, e.g.
     /// ":1.588". Used to direct the ActionInvoked/NotificationClosed signals to the
     /// owning client instead of broadcasting them; `None` if unknown (e.g. restored
@@ -136,14 +140,34 @@ impl Notification {
     /// Returns error if the D-Bus signal emission fails.
     #[instrument(skip(self), fields(notification_id = %self.id, action = %action_key), err)]
     pub async fn invoke(&self, action_key: &str) -> Result<(), Error> {
-        let owner = self.owner.get();
-        NotificationControls::invoke(
-            &self.zbus_connection,
-            &self.id,
-            action_key,
-            owner.as_deref(),
-        )
-        .await?;
+        match self.source.get() {
+            NotificationSource::Freedesktop => {
+                let owner = self.owner.get();
+                NotificationControls::invoke(
+                    &self.zbus_connection,
+                    &self.id,
+                    action_key,
+                    owner.as_deref(),
+                )
+                .await?;
+            }
+            NotificationSource::Gtk(dispatch) => {
+                // The shell's synthetic "default" maps to the notification's
+                // default-action (or a plain `Activate` if it has none); any other key is
+                // a button. Both resolve to a `GtkAction` dispatched via ActivateAction.
+                let action = if action_key == Action::DEFAULT_ID {
+                    dispatch.default_action
+                } else {
+                    dispatch.button_actions.get(action_key).cloned()
+                };
+                NotificationControls::activate_gtk(
+                    &self.zbus_connection,
+                    &dispatch.app_id,
+                    action.as_ref(),
+                )
+                .await?;
+            }
+        }
         if !self.is_resident.get() {
             let _ = self
                 .notif_tx
@@ -181,6 +205,9 @@ impl Notification {
         self.x.set(incoming.x.get());
         self.y.set(incoming.y.get());
         self.action_icons.set(incoming.action_icons.get());
+        // A GTK replace can change the action names/targets, so refresh the dispatch data
+        // too (for freedesktop this is always `Freedesktop` → a harmless no-op).
+        self.source.replace(incoming.source.get());
     }
 
     #[allow(clippy::too_many_lines)]
@@ -280,10 +307,19 @@ impl Notification {
             .unwrap_or(false);
 
         let parsed_actions = Action::parse_dbus_actions(&props.actions);
-        let default_action = parsed_actions
-            .iter()
-            .find(|action| action.id == Action::DEFAULT_ID)
-            .cloned();
+        // GTK notifications are always body-clickable (GNOME parity): the body click
+        // invokes the default action, or `Activate`s the app if there is none. A
+        // freedesktop notification only exposes a default action if one was declared.
+        let default_action = match &props.source {
+            NotificationSource::Gtk(_) => Some(Action {
+                id: Action::DEFAULT_ID.to_string(),
+                label: String::new(),
+            }),
+            NotificationSource::Freedesktop => parsed_actions
+                .iter()
+                .find(|action| action.id == Action::DEFAULT_ID)
+                .cloned(),
+        };
 
         let hints = if !props.hints.is_empty() {
             Some(props.hints)
@@ -303,6 +339,7 @@ impl Notification {
             zbus_connection: connection.clone(),
             notif_tx,
             id,
+            source: Property::new(props.source),
             owner: Property::new(props.owner),
             app_name: Property::new(app_name),
             app_icon: Property::new(app_icon),

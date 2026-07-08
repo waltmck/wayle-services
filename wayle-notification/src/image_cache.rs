@@ -16,6 +16,37 @@ const EXPECTED_BITS_PER_SAMPLE: i32 = 8;
 const RGB_CHANNELS: i32 = 3;
 const RGBA_CHANNELS: i32 = 4;
 
+/// Caches an already-encoded image blob (e.g. the PNG bytes from a GTK `bytes` icon)
+/// verbatim and returns the file path.
+///
+/// Unlike [`cache_borrowed_image`], `data` is not raw pixels — it is a self-contained
+/// encoded image, so it is written as-is (the shell's `gtk::Image` sniffs the format).
+pub(crate) fn cache_encoded_image(data: &[u8]) -> Option<String> {
+    if data.is_empty() {
+        return None;
+    }
+
+    let dir = cache_dir();
+    let path = dir.join(format!("{}.img", content_hash(data)));
+
+    if path.exists() {
+        return Some(path_to_string(&path));
+    }
+
+    if let Err(err) = fs::create_dir_all(&dir) {
+        warn!(error = %err, "cannot create image cache directory");
+        return None;
+    }
+
+    if let Err(err) = fs::write(&path, data) {
+        warn!(error = %err, "cannot write cached image blob");
+        return None;
+    }
+
+    debug!(path = %path.display(), "cached notification image blob");
+    Some(path_to_string(&path))
+}
+
 /// Caches borrowed raw pixel data as a PNG file and returns the file path.
 pub(crate) fn cache_borrowed_image(image: BorrowedImageData<'_>) -> Option<String> {
     cache_image_data(

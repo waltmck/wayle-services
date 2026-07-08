@@ -10,7 +10,7 @@ use wayle_traits::ServiceMonitoring;
 use zbus::{Connection, fdo::DBusProxy};
 
 use crate::{
-    core::notification::Notification,
+    core::{notification::Notification, types::NotificationSource},
     error::Error,
     events::NotificationEvent,
     persistence::NotificationStore,
@@ -106,10 +106,13 @@ fn strip_actions(notif: &Notification) {
     notif.actions.set(vec![]);
 }
 
-/// Reactively strips a notification's actions once its owning D-Bus connection is gone
-/// (the app can no longer service them). Fully signal-driven: subscribe to
-/// `NameOwnerChanged`, seed once from the current bus names, then react to removals.
-/// No polling.
+/// Reactively strips a notification's actions once its dispatch target is unreachable and
+/// cannot be reached later — a freedesktop owner whose connection is gone, or a GTK app
+/// that has exited and is not D-Bus-activatable (so it can't be cold-launched). GTK
+/// notifications for activatable apps keep their actions even after the app exits.
+///
+/// Fully signal-driven: subscribe to `NameOwnerChanged`, seed once from the current bus
+/// names, then react to disconnects. No polling.
 fn spawn_owner_watching(
     notifications: Property<Vec<Arc<Notification>>>,
     popups: Property<Vec<Arc<Notification>>>,
@@ -128,22 +131,13 @@ fn spawn_owner_watching(
             return;
         };
 
-        // Seed: strip notifications/popups whose owner is unknown or no longer on the bus
-        // (restored from a prior session, or an app that exited while we were down).
-        match dbus_proxy.list_names().await {
-            Ok(names) => {
-                let live: HashSet<String> =
-                    names.into_iter().map(|name| name.to_string()).collect();
-                let notifs = notifications.get();
-                let pops = popups.get();
-                for notif in notifs.iter().chain(pops.iter()) {
-                    if !notif.owner.get().is_some_and(|owner| live.contains(&owner)) {
-                        strip_actions(notif);
-                    }
-                }
-            }
-            Err(err) => {
-                warn!(error = %err, "cannot list D-Bus names to reconcile notification owners");
+        // Seed: reconcile notifications restored from a prior session and apps that
+        // exited while we were down.
+        let live = fetch_names(&dbus_proxy).await;
+        let activatable = fetch_activatable_names(&dbus_proxy).await;
+        for notif in notifications.get().iter().chain(popups.get().iter()) {
+            if should_strip(notif, &live, &activatable) {
+                strip_actions(notif);
             }
         }
 
@@ -160,18 +154,101 @@ fn spawn_owner_watching(
                     }
 
                     let vanished = args.name().to_string();
-                    let notifs = notifications.get();
-                    let pops = popups.get();
-                    for notif in notifs.iter().chain(pops.iter()) {
-                        if notif.owner.get().as_deref() == Some(vanished.as_str()) {
-                            debug!(id = notif.id, owner = %vanished, "owner disconnected, stripping actions");
-                            strip_actions(notif);
-                        }
-                    }
+                    react_to_disconnect(&dbus_proxy, &notifications, &popups, &vanished).await;
                 }
             }
         }
     });
+}
+
+/// Whether a notification's actions should be stripped given the currently-owned
+/// (`live`) and D-Bus-activatable (`activatable`) bus names.
+fn should_strip(
+    notif: &Notification,
+    live: &HashSet<String>,
+    activatable: &HashSet<String>,
+) -> bool {
+    match notif.source.get() {
+        // freedesktop: the owning connection is the only dispatch target. If it's gone
+        // (or unknown), the actions can never fire again.
+        NotificationSource::Freedesktop => match notif.owner.get() {
+            Some(owner) => !live.contains(&owner),
+            None => true,
+        },
+        // GTK: dispatch is by app id, which stays reachable while the app runs OR if it
+        // can be cold-launched (activatable). Strip only when neither holds.
+        NotificationSource::Gtk(dispatch) => {
+            !live.contains(&dispatch.app_id) && !activatable.contains(&dispatch.app_id)
+        }
+    }
+}
+
+/// Re-evaluates notifications whose dispatch target is the just-vanished bus name.
+async fn react_to_disconnect(
+    dbus_proxy: &DBusProxy<'_>,
+    notifications: &Property<Vec<Arc<Notification>>>,
+    popups: &Property<Vec<Arc<Notification>>>,
+    vanished: &str,
+) {
+    let notifs = notifications.get();
+    let pops = popups.get();
+
+    // freedesktop notifications owned by the vanished unique name die immediately. Note
+    // any GTK notification for the vanished app id: those need the (async) activatable
+    // check, which we do only if there's a match to judge.
+    let mut gtk_target_gone = false;
+    for notif in notifs.iter().chain(pops.iter()) {
+        match notif.source.get() {
+            NotificationSource::Freedesktop => {
+                if notif.owner.get().as_deref() == Some(vanished) {
+                    debug!(id = notif.id, name = %vanished, "owner disconnected, stripping actions");
+                    strip_actions(notif);
+                }
+            }
+            NotificationSource::Gtk(dispatch) => {
+                if dispatch.app_id == vanished {
+                    gtk_target_gone = true;
+                }
+            }
+        }
+    }
+
+    if !gtk_target_gone {
+        return;
+    }
+
+    // The app exited; keep its notifications' actions only if it can be cold-launched.
+    if fetch_activatable_names(dbus_proxy).await.contains(vanished) {
+        return;
+    }
+
+    for notif in notifs.iter().chain(pops.iter()) {
+        if matches!(notif.source.get(), NotificationSource::Gtk(dispatch) if dispatch.app_id == vanished)
+        {
+            debug!(id = notif.id, app_id = %vanished, "gtk app gone and not activatable, stripping actions");
+            strip_actions(notif);
+        }
+    }
+}
+
+async fn fetch_names(dbus_proxy: &DBusProxy<'_>) -> HashSet<String> {
+    match dbus_proxy.list_names().await {
+        Ok(names) => names.into_iter().map(|name| name.to_string()).collect(),
+        Err(err) => {
+            warn!(error = %err, "cannot list D-Bus names to reconcile notification owners");
+            HashSet::new()
+        }
+    }
+}
+
+async fn fetch_activatable_names(dbus_proxy: &DBusProxy<'_>) -> HashSet<String> {
+    match dbus_proxy.list_activatable_names().await {
+        Ok(names) => names.into_iter().map(|name| name.to_string()).collect(),
+        Err(err) => {
+            warn!(error = %err, "cannot list activatable D-Bus names");
+            HashSet::new()
+        }
+    }
 }
 
 fn handle_popup_added(

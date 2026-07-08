@@ -1,7 +1,7 @@
 use std::{
     collections::HashMap,
     sync::{
-        Mutex,
+        Arc, Mutex,
         atomic::{AtomicU32, Ordering},
     },
 };
@@ -19,7 +19,10 @@ use zbus::{
 use crate::{
     core::{
         notification::Notification,
-        types::{BorrowedImageData, IncomingHints, NotificationHints, NotificationProps},
+        types::{
+            BorrowedImageData, IncomingHints, NotificationHints, NotificationProps,
+            NotificationSource,
+        },
     },
     events::NotificationEvent,
     glob, image_cache,
@@ -27,11 +30,42 @@ use crate::{
     types::{Capabilities, ClosedReason, Name, SpecVersion, Vendor, Version},
 };
 
+/// Monotonic notification-id allocator shared by the freedesktop and GTK daemons so
+/// their `u32` ids never collide. Persists a high-water mark so the counter never
+/// rewinds across a restart — a rewound id could be reissued to a new notification while
+/// a long-lived client still holds the old one, sending its action to the wrong client.
+#[derive(Debug)]
+pub(crate) struct IdCounter {
+    counter: AtomicU32,
+    #[debug(skip)]
+    store: Option<NotificationStore>,
+}
+
+impl IdCounter {
+    pub(crate) fn new(start: u32, store: Option<NotificationStore>) -> Self {
+        Self {
+            counter: AtomicU32::new(start),
+            store,
+        }
+    }
+
+    /// Issues a fresh, never-before-used id and records it as the persisted high-water
+    /// mark.
+    pub(crate) fn next_id(&self) -> u32 {
+        let new_id = self.counter.fetch_add(1, Ordering::Relaxed);
+        if let Some(store) = &self.store
+            && let Err(err) = store.record_id_high_water(new_id)
+        {
+            warn!(new_id, error = %err, "cannot persist notification id high-water mark");
+        }
+        new_id
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct NotificationDaemon {
-    pub counter: AtomicU32,
     #[debug(skip)]
-    pub store: Option<NotificationStore>,
+    pub id_counter: Arc<IdCounter>,
     #[debug(skip)]
     pub zbus_connection: Connection,
     #[debug(skip)]
@@ -95,6 +129,7 @@ impl NotificationDaemon {
                 expire_timeout,
                 timestamp: Utc::now(),
                 owner,
+                source: NotificationSource::Freedesktop,
             },
             self.zbus_connection.clone(),
             self.notif_tx.clone(),
@@ -136,24 +171,11 @@ impl NotificationDaemon {
 }
 
 impl NotificationDaemon {
-    /// Issues a fresh, never-before-used notification id and records it as the
-    /// persisted high-water mark, so the counter never rewinds across a restart
-    /// (reusing an id would let an action reach a stale, still-running client).
-    fn next_id(&self) -> u32 {
-        let new_id = self.counter.fetch_add(1, Ordering::Relaxed);
-        if let Some(store) = &self.store
-            && let Err(err) = store.record_id_high_water(new_id)
-        {
-            warn!(new_id, error = %err, "cannot persist notification id high-water mark");
-        }
-        new_id
-    }
-
     /// Only allows an app to reuse `replaces_id` values it owns.
     /// Assigns a new ID otherwise.
     fn resolve_id(&self, replaces_id: u32, app_name: &str) -> u32 {
         if replaces_id == 0 {
-            let new_id = self.next_id();
+            let new_id = self.id_counter.next_id();
             debug!(new_id, "assigned new notification id");
             return new_id;
         }
@@ -169,7 +191,7 @@ impl NotificationDaemon {
             debug!(replaces_id, "reusing replaces_id owned by same app");
             replaces_id
         } else {
-            let new_id = self.next_id();
+            let new_id = self.id_counter.next_id();
             debug!(
                 replaces_id,
                 new_id, "replaces_id belongs to different app, assigned new id"

@@ -10,6 +10,8 @@ pub(crate) mod dbus {
     pub const SERVICE_INTERFACE: &str = "org.freedesktop.Notifications";
     pub const WAYLE_SERVICE_NAME: &str = "com.wayle.Notifications1";
     pub const WAYLE_SERVICE_PATH: &str = "/com/wayle/Notifications";
+    pub const GTK_SERVICE_NAME: &str = "org.gtk.Notifications";
+    pub const GTK_SERVICE_PATH: &str = "/org/gtk/Notifications";
 }
 
 pub(crate) type Name = String;

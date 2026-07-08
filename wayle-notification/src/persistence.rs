@@ -8,13 +8,14 @@ use std::{
 use chrono::{DateTime, Utc};
 use derive_more::Debug;
 use rusqlite::{Connection, OptionalExtension, params};
+use serde::{Deserialize, Serialize};
 use tracing::{debug, instrument, warn};
 use zbus::zvariant::{OwnedValue, Str};
 
 use crate::{
     core::{
         notification::Notification,
-        types::{Action, IMAGE_DATA_KEYS},
+        types::{Action, GtkAction, GtkDispatch, IMAGE_DATA_KEYS, NotificationSource},
     },
     error::Error,
 };
@@ -33,6 +34,7 @@ pub(crate) struct StoredNotification {
     pub expire_timeout: Option<u32>,
     pub timestamp: i64,
     pub owner: Option<String>,
+    pub source: NotificationSource,
 }
 
 impl From<&Notification> for StoredNotification {
@@ -50,7 +52,103 @@ impl From<&Notification> for StoredNotification {
             expire_timeout: notification.expire_timeout.get(),
             timestamp: notification.timestamp.get().timestamp_millis(),
             owner: notification.owner.get(),
+            source: notification.source.get(),
         }
+    }
+}
+
+/// On-disk form of [`NotificationSource`]. Kept separate from the runtime type so action
+/// targets serialize through the same `serde_json::Value` round-trip proven to work for
+/// `OwnedValue` hints.
+#[derive(Serialize, Deserialize)]
+struct StoredSource {
+    kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    gtk: Option<StoredGtkDispatch>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct StoredGtkDispatch {
+    app_id: String,
+    gtk_id: String,
+    default_action: Option<StoredGtkAction>,
+    button_actions: HashMap<String, StoredGtkAction>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct StoredGtkAction {
+    name: String,
+    /// The action target, stored as the JSON-serialized `OwnedValue`. Kept as a string
+    /// (not an inline object) because `OwnedValue` deserializes by borrowing from the
+    /// input, which `serde_json::from_str` supports but `from_value` does not.
+    target: Option<String>,
+}
+
+fn serialize_source(source: &NotificationSource) -> String {
+    let stored = match source {
+        NotificationSource::Freedesktop => StoredSource {
+            kind: String::from("fdo"),
+            gtk: None,
+        },
+        NotificationSource::Gtk(dispatch) => StoredSource {
+            kind: String::from("gtk"),
+            gtk: Some(StoredGtkDispatch {
+                app_id: dispatch.app_id.clone(),
+                gtk_id: dispatch.gtk_id.clone(),
+                default_action: dispatch.default_action.as_ref().map(stored_action),
+                button_actions: dispatch
+                    .button_actions
+                    .iter()
+                    .map(|(key, action)| (key.clone(), stored_action(action)))
+                    .collect(),
+            }),
+        },
+    };
+    serde_json::to_string(&stored).unwrap_or_else(|err| {
+        warn!(error = %err, "cannot serialize notification source");
+        String::from(r#"{"kind":"fdo"}"#)
+    })
+}
+
+fn deserialize_source(raw: Option<String>) -> NotificationSource {
+    let Some(raw) = raw else {
+        return NotificationSource::Freedesktop;
+    };
+    let Ok(stored) = serde_json::from_str::<StoredSource>(&raw) else {
+        warn!("cannot deserialize notification source; treating as freedesktop");
+        return NotificationSource::Freedesktop;
+    };
+    match (stored.kind.as_str(), stored.gtk) {
+        ("gtk", Some(gtk)) => NotificationSource::Gtk(GtkDispatch {
+            app_id: gtk.app_id,
+            gtk_id: gtk.gtk_id,
+            default_action: gtk.default_action.map(gtk_action_from_stored),
+            button_actions: gtk
+                .button_actions
+                .into_iter()
+                .map(|(key, action)| (key, gtk_action_from_stored(action)))
+                .collect(),
+        }),
+        _ => NotificationSource::Freedesktop,
+    }
+}
+
+fn stored_action(action: &GtkAction) -> StoredGtkAction {
+    StoredGtkAction {
+        name: action.name.clone(),
+        target: action
+            .target
+            .as_ref()
+            .and_then(|target| serde_json::to_string(target).ok()),
+    }
+}
+
+fn gtk_action_from_stored(stored: StoredGtkAction) -> GtkAction {
+    GtkAction {
+        name: stored.name,
+        target: stored
+            .target
+            .and_then(|json| serde_json::from_str::<OwnedValue>(&json).ok()),
     }
 }
 
@@ -89,7 +187,8 @@ impl NotificationStore {
                     expire_timeout INTEGER,
                     timestamp INTEGER NOT NULL,
                     image_path TEXT,
-                    owner TEXT
+                    owner TEXT,
+                    source TEXT
                 )",
                 [],
             )
@@ -112,6 +211,25 @@ impl NotificationStore {
             connection
                 .execute("ALTER TABLE notifications ADD COLUMN owner TEXT", [])
                 .map_err(|err| Error::DatabaseError(format!("cannot add owner column: {err}")))?;
+        }
+
+        // Likewise migrate databases that predate the `source` column (freedesktop vs GTK
+        // origin + GTK action-dispatch data). Rows without it read back as freedesktop.
+        let has_source_column = {
+            let mut stmt = connection
+                .prepare("PRAGMA table_info(notifications)")
+                .map_err(|err| Error::DatabaseError(format!("cannot inspect schema: {err}")))?;
+            let columns = stmt
+                .query_map([], |row| row.get::<_, String>(1))
+                .map_err(|err| Error::DatabaseError(format!("cannot read schema: {err}")))?;
+            columns
+                .filter_map(Result::ok)
+                .any(|column| column == "source")
+        };
+        if !has_source_column {
+            connection
+                .execute("ALTER TABLE notifications ADD COLUMN source TEXT", [])
+                .map_err(|err| Error::DatabaseError(format!("cannot add source column: {err}")))?;
         }
 
         connection
@@ -236,14 +354,16 @@ impl NotificationStore {
         let hints_json = serde_json::to_string(&hints_for_storage)
             .map_err(|err| Error::DatabaseError(format!("cannot serialize hints: {err}")))?;
 
+        let source_json = serialize_source(&stored.source);
+
         self.connection
             .lock()
             .map_err(|_| Error::DatabaseError("cannot acquire lock on database".to_string()))?
             .execute(
                 "INSERT OR REPLACE INTO notifications
                  (id, app_name, replaces_id, app_icon, summary, body, actions, hints,
-                 expire_timeout, timestamp, image_path, owner)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                 expire_timeout, timestamp, image_path, owner, source)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
                 params![
                     stored.id,
                     stored.app_name,
@@ -257,6 +377,7 @@ impl NotificationStore {
                     stored.timestamp,
                     stored.image_path,
                     stored.owner,
+                    source_json,
                 ],
             )
             .map_err(|err| Error::DatabaseError(format!("cannot store notification: {err}")))?;
@@ -284,7 +405,7 @@ impl NotificationStore {
         let mut stmt = conn
             .prepare(
                 "SELECT id, app_name, replaces_id, app_icon, summary, body,
-                 actions, hints, expire_timeout, timestamp, image_path, owner
+                 actions, hints, expire_timeout, timestamp, image_path, owner, source
                  FROM notifications
                  ORDER BY timestamp DESC",
             )
@@ -295,6 +416,7 @@ impl NotificationStore {
                 let actions_json: String = row.get(6)?;
                 let hints_json: String = row.get(7)?;
                 let image_path: Option<String> = row.get(10)?;
+                let source: Option<String> = row.get(12)?;
 
                 let actions: Vec<String> =
                     serde_json::from_str(&actions_json).unwrap_or_else(|err| {
@@ -335,6 +457,7 @@ impl NotificationStore {
                     expire_timeout: row.get(8)?,
                     timestamp: row.get(9)?,
                     owner: row.get(11)?,
+                    source: deserialize_source(source),
                 })
             })
             .map_err(|err| Error::DatabaseError(format!("cannot query notifications: {err}")))?
@@ -366,5 +489,63 @@ impl NotificationStore {
             "loaded stored notifications (expired filtered)"
         );
         Ok(notifications)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use zbus::zvariant::{OwnedValue, Str};
+
+    use super::*;
+
+    #[test]
+    fn source_round_trips_gtk_dispatch_with_target() {
+        let mut button_actions = HashMap::new();
+        button_actions.insert(
+            String::from("app.open"),
+            GtkAction {
+                name: String::from("open"),
+                target: Some(OwnedValue::from(Str::from("chat-42"))),
+            },
+        );
+        let source = NotificationSource::Gtk(GtkDispatch {
+            app_id: String::from("org.gnome.Fractal"),
+            gtk_id: String::from("msg-1"),
+            default_action: Some(GtkAction {
+                name: String::from("show"),
+                target: None,
+            }),
+            button_actions,
+        });
+
+        let restored = deserialize_source(Some(serialize_source(&source)));
+
+        let NotificationSource::Gtk(dispatch) = restored else {
+            panic!("expected a gtk source");
+        };
+        assert_eq!(dispatch.app_id, "org.gnome.Fractal");
+        assert_eq!(dispatch.gtk_id, "msg-1");
+        let default = dispatch.default_action.expect("default action preserved");
+        assert_eq!(default.name, "show");
+        assert!(default.target.is_none());
+        let action = dispatch
+            .button_actions
+            .get("app.open")
+            .expect("button action preserved");
+        assert_eq!(action.name, "open");
+        let target = action.target.as_ref().expect("target preserved");
+        assert_eq!(target.downcast_ref::<String>().unwrap(), "chat-42");
+    }
+
+    #[test]
+    fn source_absent_or_unknown_defaults_to_freedesktop() {
+        assert!(matches!(
+            deserialize_source(None),
+            NotificationSource::Freedesktop
+        ));
+        assert!(matches!(
+            deserialize_source(Some(String::from("garbage"))),
+            NotificationSource::Freedesktop
+        ));
     }
 }
