@@ -56,22 +56,35 @@ impl NotificationService {
         NotificationServiceBuilder::new()
     }
 
+    /// Dismisses several notifications at once as a single atomic batch — one store
+    /// delete and one reactive list update for the whole set, rather than per id. Empty
+    /// input is a no-op.
+    pub fn dismiss_many(&self, ids: Vec<u32>) {
+        if ids.is_empty() {
+            return;
+        }
+
+        if let Err(error) = self.notif_tx.send(NotificationEvent::RemoveMany(
+            ids,
+            ClosedReason::DismissedByUser,
+        )) {
+            warn!(error = %error, "cannot dismiss notifications");
+        }
+    }
+
     /// Dismisses all notifications and emits `NotificationClosed` for each.
     ///
     /// # Errors
     /// Returns error if the event channel is closed.
     #[instrument(skip(self), err)]
     pub async fn dismiss_all(&self) -> Result<(), Error> {
-        let notifications = self.notifications.get();
-
-        for notif in notifications.iter() {
-            if let Err(error) = self.notif_tx.send(NotificationEvent::Remove(
-                notif.id,
-                ClosedReason::DismissedByUser,
-            )) {
-                warn!(error = %error, id = notif.id, "cannot dismiss notification");
-            }
-        }
+        let ids = self
+            .notifications
+            .get()
+            .iter()
+            .map(|notif| notif.id)
+            .collect();
+        self.dismiss_many(ids);
 
         Ok(())
     }

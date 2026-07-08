@@ -396,6 +396,32 @@ impl NotificationStore {
         Ok(())
     }
 
+    /// Removes several notifications in a single atomic `DELETE` rather than one statement
+    /// per id. The ids are `u32`, so inlining them in the `IN` clause is injection-safe.
+    #[instrument(skip(self, ids), fields(count = ids.len()), err)]
+    pub fn remove_many(&self, ids: &[u32]) -> Result<(), Error> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+
+        let placeholders = ids
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+
+        self.connection
+            .lock()
+            .map_err(|_| Error::DatabaseError("cannot acquire lock on database".to_string()))?
+            .execute(
+                &format!("DELETE FROM notifications WHERE id IN ({placeholders})"),
+                [],
+            )
+            .map_err(|err| Error::DatabaseError(format!("cannot remove notifications: {err}")))?;
+
+        Ok(())
+    }
+
     #[instrument(skip(self), err)]
     pub fn load_all(&self, remove_expired: bool) -> Result<Vec<StoredNotification>, Error> {
         let conn = self
