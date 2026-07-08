@@ -81,6 +81,17 @@ async fn handle_notifications(service: &NotificationService) -> Result<(), Error
                                 &popup_timers,
                             ).await;
                         }
+                        NotificationEvent::RemoveMany(ids, reason) => {
+                            handle_notifications_removed_batch(
+                                ids,
+                                reason,
+                                &notification_list,
+                                &popup_list,
+                                &store,
+                                &connection,
+                                &popup_timers,
+                            ).await;
+                        }
                     }
                 }
             }
@@ -435,5 +446,75 @@ async fn handle_notification_removed(
         .await
     {
         warn!(id = id, error = %err, "cannot emit NotificationClosed signal");
+    }
+}
+
+/// Removes several notifications at once ("clear all" / clear a group). Does the reactive
+/// list updates and the store delete a SINGLE time for the whole batch, instead of the
+/// O(n) rebuild + one `DELETE` per id that repeated [`handle_notification_removed`] calls
+/// would incur. Only `NotificationClosed` stays per-notification: each fdo client must be
+/// told about its own id (directed to its owner; GTK notifications have no owner and no
+/// close signal, so they're skipped).
+async fn handle_notifications_removed_batch(
+    ids: Vec<u32>,
+    reason: ClosedReason,
+    notifications: &Property<Vec<Arc<Notification>>>,
+    popups: &Property<Vec<Arc<Notification>>>,
+    store: &Option<NotificationStore>,
+    connection: &Connection,
+    popup_timers: &Arc<PopupTimerManager>,
+) {
+    if ids.is_empty() {
+        return;
+    }
+    let id_set: HashSet<u32> = ids.iter().copied().collect();
+
+    // Drop all matched popups (and cancel their timers) in one update, mirroring the
+    // single-removal rule that expiry leaves popups untouched.
+    if !matches!(reason, ClosedReason::Expired) {
+        for id in &ids {
+            popup_timers.cancel(*id);
+        }
+        let mut popup_list = popups.get();
+        popup_list.retain(|popup| !id_set.contains(&popup.id));
+        popups.set(popup_list);
+    }
+
+    // Capture owners before removal so the close signals can be directed, then drop all
+    // matched notifications from history in a single update.
+    let mut notif_list = notifications.get();
+    let removed: Vec<(u32, Option<String>)> = notif_list
+        .iter()
+        .filter(|notif| id_set.contains(&notif.id))
+        .map(|notif| (notif.id, notif.owner.get()))
+        .collect();
+    if removed.is_empty() {
+        return;
+    }
+    notif_list.retain(|notif| !id_set.contains(&notif.id));
+    notifications.set(notif_list);
+
+    if let Some(store) = store.as_ref() {
+        let removed_ids: Vec<u32> = removed.iter().map(|(id, _)| *id).collect();
+        let _ = store.remove_many(&removed_ids);
+    }
+
+    for (id, owner) in removed {
+        let Some(owner) = owner else {
+            continue;
+        };
+        debug!(id = id, ?reason, "emitting NotificationClosed");
+        if let Err(err) = connection
+            .emit_signal(
+                Some(owner.as_str()),
+                SERVICE_PATH,
+                SERVICE_INTERFACE,
+                Signal::NotificationClosed.as_str(),
+                &(id, reason as u32),
+            )
+            .await
+        {
+            warn!(id = id, error = %err, "cannot emit NotificationClosed signal");
+        }
     }
 }
