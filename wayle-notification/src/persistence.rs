@@ -457,7 +457,13 @@ impl NotificationStore {
                 let mut hints: HashMap<String, OwnedValue> = hints_json_map
                     .into_iter()
                     .filter_map(|(key, value)| {
-                        serde_json::from_value::<OwnedValue>(value)
+                        // `from_value` cannot rebuild string-valued `OwnedValue`s — its
+                        // deserializer needs *borrowed* input — so it silently dropped
+                        // every string hint on reload (desktop-entry, category,
+                        // sound-file, ...). Re-serialize and go through `from_str`, which
+                        // borrows from the JSON text and round-trips correctly.
+                        let json = serde_json::to_string(&value).ok()?;
+                        serde_json::from_str::<OwnedValue>(&json)
                             .ok()
                             .map(|owned_value| (key, owned_value))
                     })
@@ -561,6 +567,41 @@ mod tests {
         assert_eq!(action.name, "open");
         let target = action.target.as_ref().expect("target preserved");
         assert_eq!(target.downcast_ref::<String>().unwrap(), "chat-42");
+    }
+
+    /// Serialize hints as `add()` does, then rebuild them as `load_all` does.
+    fn roundtrip(hints: &HashMap<String, OwnedValue>) -> HashMap<String, OwnedValue> {
+        let json = serde_json::to_string(hints).expect("serialize hints");
+        let value_map: HashMap<String, serde_json::Value> =
+            serde_json::from_str(&json).expect("parse hints json");
+        value_map
+            .into_iter()
+            .filter_map(|(key, value)| {
+                let json = serde_json::to_string(&value).ok()?;
+                serde_json::from_str::<OwnedValue>(&json)
+                    .ok()
+                    .map(|owned| (key, owned))
+            })
+            .collect()
+    }
+
+    /// Regression guard: string-valued hints must survive the store→load JSON
+    /// round-trip. `serde_json::from_value::<OwnedValue>` used to drop them
+    /// (needs borrowed input), which silently lost `desktop-entry` on reload.
+    #[test]
+    fn string_hint_survives_roundtrip() {
+        let mut hints: HashMap<String, OwnedValue> = HashMap::new();
+        hints.insert(
+            String::from("desktop-entry"),
+            OwnedValue::from(Str::from("org.gnome.clocks")),
+        );
+
+        let loaded = roundtrip(&hints);
+
+        let desktop_entry = loaded
+            .get("desktop-entry")
+            .and_then(|hint| hint.downcast_ref::<String>().ok());
+        assert_eq!(desktop_entry.as_deref(), Some("org.gnome.clocks"));
     }
 
     #[test]
