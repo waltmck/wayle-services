@@ -10,7 +10,11 @@ use derive_more::Debug;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, instrument, warn};
-use zbus::zvariant::{OwnedValue, Str};
+use zbus::zvariant::{
+    LE, OwnedValue, Str, Value,
+    serialized::{Context, Data},
+    to_bytes,
+};
 
 use crate::{
     core::{
@@ -78,9 +82,9 @@ struct StoredGtkDispatch {
 #[derive(Serialize, Deserialize)]
 struct StoredGtkAction {
     name: String,
-    /// The action target, stored as the JSON-serialized `OwnedValue`. Kept as a string
-    /// (not an inline object) because `OwnedValue` deserializes by borrowing from the
-    /// input, which `serde_json::from_str` supports but `from_value` does not.
+    /// The action target, stored as its D-Bus wire encoding (a self-describing variant)
+    /// held as a JSON byte array. See [`encode_target`] for why the encoding is bytes and
+    /// not `serde_json` of the `OwnedValue` directly.
     target: Option<String>,
 }
 
@@ -136,20 +140,44 @@ fn deserialize_source(raw: Option<String>) -> NotificationSource {
 fn stored_action(action: &GtkAction) -> StoredGtkAction {
     StoredGtkAction {
         name: action.name.clone(),
-        target: action
-            .target
-            .as_ref()
-            .and_then(|target| serde_json::to_string(target).ok()),
+        target: action.target.as_ref().and_then(encode_target),
     }
 }
 
 fn gtk_action_from_stored(stored: StoredGtkAction) -> GtkAction {
     GtkAction {
         name: stored.name,
-        target: stored
-            .target
-            .and_then(|json| serde_json::from_str::<OwnedValue>(&json).ok()),
+        target: stored.target.as_deref().and_then(decode_target),
     }
+}
+
+/// Serializes an action target to the D-Bus wire format (a self-describing variant that
+/// embeds its own signature) held as a JSON byte array.
+///
+/// The obvious `serde_json::to_string(&owned_value)` is *not* reversible: `OwnedValue`'s
+/// deserializer rebuilds borrowed scalars/strings from JSON but cannot reconstruct a
+/// `Structure` or other composite variant — it needs the D-Bus type system, not JSON's.
+/// So a structured target such as a `(yay)` serialized fine yet came back as `None` on
+/// reload, and the action was then dispatched with an empty parameter, which the app
+/// rejects ("expected type (yay) but got type ()"). The wire encoding carries the full
+/// signature, so any GVariant an app attaches survives store→load intact.
+fn encode_target(target: &OwnedValue) -> Option<String> {
+    let value: &Value = target;
+    let data = to_bytes(Context::new_dbus(LE, 0), value).ok()?;
+    serde_json::to_string(&*data).ok()
+}
+
+/// Inverse of [`encode_target`]. Falls back to the legacy `serde_json`-of-`OwnedValue`
+/// encoding so targets persisted before the wire-format switch (scalars/strings, which
+/// that path could still read) keep working across the upgrade.
+fn decode_target(stored: &str) -> Option<OwnedValue> {
+    if let Ok(bytes) = serde_json::from_str::<Vec<u8>>(stored) {
+        let data = Data::new(bytes, Context::new_dbus(LE, 0));
+        if let Ok((value, _)) = data.deserialize::<Value<'_>>() {
+            return OwnedValue::try_from(value).ok();
+        }
+    }
+    serde_json::from_str::<OwnedValue>(stored).ok()
 }
 
 #[derive(Debug, Clone)]
@@ -526,9 +554,13 @@ impl NotificationStore {
 
 #[cfg(test)]
 mod tests {
-    use zbus::zvariant::{OwnedValue, Str};
+    use zbus::zvariant::{ObjectPath, OwnedValue, Str, Value};
 
     use super::*;
+
+    fn owned(value: Value<'_>) -> OwnedValue {
+        OwnedValue::try_from(value).expect("value converts to OwnedValue")
+    }
 
     #[test]
     fn source_round_trips_gtk_dispatch_with_target() {
@@ -567,6 +599,241 @@ mod tests {
         assert_eq!(action.name, "open");
         let target = action.target.as_ref().expect("target preserved");
         assert_eq!(target.downcast_ref::<String>().unwrap(), "chat-42");
+    }
+
+    /// Regression guard for a *structured* action target (e.g. a `(yay)`): it must
+    /// survive store→load. `serde_json::from_str::<OwnedValue>` rebuilds borrowed
+    /// scalars/strings from JSON but cannot reconstruct a `Structure`/composite variant,
+    /// so the previous `serde_json`-of-`OwnedValue` encoding serialized such a target
+    /// fine yet deserialized it back to `None`. The action was then dispatched with an
+    /// empty parameter and the app rejected it ("expected type (yay) but got type ()").
+    #[test]
+    fn source_round_trips_structured_default_action_target() {
+        let target = OwnedValue::try_from(Value::new((5u8, vec![1u8, 2, 3]))).unwrap();
+        assert_eq!(target.value_signature().to_string(), "(yay)");
+
+        let source = NotificationSource::Gtk(GtkDispatch {
+            app_id: String::from("de.schmidhuberj.Flare"),
+            gtk_id: String::from("msg-1"),
+            default_action: Some(GtkAction {
+                name: String::from("notification-clicked"),
+                target: Some(target.try_clone().unwrap()),
+            }),
+            button_actions: HashMap::new(),
+        });
+
+        let restored = deserialize_source(Some(serialize_source(&source)));
+
+        let NotificationSource::Gtk(dispatch) = restored else {
+            panic!("expected a gtk source");
+        };
+        let default = dispatch.default_action.expect("default action preserved");
+        assert_eq!(default.name, "notification-clicked");
+        let restored_target = default.target.expect("structured target preserved");
+        assert_eq!(restored_target.value_signature().to_string(), "(yay)");
+        assert_eq!(restored_target, target);
+    }
+
+    /// The target encoding must survive store→load for every shape of GVariant an app
+    /// might attach to an action — scalars, strings, object paths, arrays, tuples,
+    /// nested tuples and dicts. Each case asserts (a) the signature is unchanged and
+    /// (b) re-encoding the restored value yields byte-identical wire data, which proves
+    /// value *and* type survived exactly without relying on `OwnedValue`'s equality for
+    /// composite types.
+    #[test]
+    fn action_target_round_trips_across_gvariant_schemas() {
+        let mut dict_ss: HashMap<String, String> = HashMap::new();
+        dict_ss.insert(String::from("key"), String::from("value"));
+        let mut dict_si: HashMap<String, i32> = HashMap::new();
+        dict_si.insert(String::from("count"), 7);
+        let mut dict_sv: HashMap<String, Value> = HashMap::new();
+        dict_sv.insert(String::from("id"), Value::new(42i32));
+
+        let cases: Vec<(&str, OwnedValue)> = vec![
+            // Scalars, one per D-Bus basic type.
+            ("y", owned(Value::U8(255))),
+            ("b", owned(Value::Bool(true))),
+            ("n", owned(Value::I16(-1234))),
+            ("q", owned(Value::U16(60000))),
+            ("i", owned(Value::I32(-42))),
+            ("u", owned(Value::U32(42))),
+            ("x", owned(Value::I64(-5_000_000_000))),
+            ("t", owned(Value::U64(5_000_000_000))),
+            ("d", owned(Value::F64(3.5))),
+            ("s", owned(Value::new("conversation-42"))),
+            (
+                "o",
+                owned(Value::new(
+                    ObjectPath::try_from("/de/schmidhuberj/Flare/chat/7").unwrap(),
+                )),
+            ),
+            // Arrays, including the byte array a naive JSON encoding could mangle.
+            ("ay", owned(Value::new(vec![0u8, 1, 2, 255]))),
+            ("ai", owned(Value::new(vec![1i32, -2, 3]))),
+            (
+                "as",
+                owned(Value::new(vec![String::from("a"), String::from("b")])),
+            ),
+            // Tuples / structures, the shapes the old serde_json path silently dropped.
+            ("(yay)", owned(Value::new((5u8, vec![1u8, 2, 3])))),
+            ("(si)", owned(Value::new((String::from("chat"), 7i32)))),
+            (
+                "(ss)",
+                owned(Value::new((String::from("a"), String::from("b")))),
+            ),
+            (
+                "((si)s)",
+                owned(Value::new((
+                    (String::from("inner"), 7i32),
+                    String::from("outer"),
+                ))),
+            ),
+            // Dicts, including a vardict (a{sv}) whose values are themselves variants.
+            ("a{ss}", owned(Value::new(dict_ss))),
+            ("a{si}", owned(Value::new(dict_si))),
+            ("a{sv}", owned(Value::new(dict_sv))),
+        ];
+
+        for (expected_sig, target) in &cases {
+            let encoded =
+                encode_target(target).unwrap_or_else(|| panic!("encode failed for {expected_sig}"));
+            let decoded = decode_target(&encoded)
+                .unwrap_or_else(|| panic!("decode failed for {expected_sig}"));
+            assert_eq!(
+                decoded.value_signature().to_string(),
+                *expected_sig,
+                "signature changed for {expected_sig}"
+            );
+            let reencoded = encode_target(&decoded)
+                .unwrap_or_else(|| panic!("re-encode failed for {expected_sig}"));
+            assert_eq!(reencoded, encoded, "wire bytes changed for {expected_sig}");
+        }
+    }
+
+    /// End-to-end through `serialize_source`/`deserialize_source`: a dispatch with a
+    /// structured default action plus several buttons carrying differently-typed targets
+    /// (and one with none) must come back intact, keyed correctly.
+    #[test]
+    fn source_round_trips_dispatch_with_mixed_target_schemas() {
+        let mut button_actions = HashMap::new();
+        button_actions.insert(
+            String::from("app.reply"),
+            GtkAction {
+                name: String::from("reply"),
+                target: Some(owned(Value::new("thread-9"))),
+            },
+        );
+        button_actions.insert(
+            String::from("app.mark"),
+            GtkAction {
+                name: String::from("mark"),
+                target: Some(owned(Value::new((1u8, vec![9u8, 8, 7])))),
+            },
+        );
+        button_actions.insert(
+            String::from("app.count"),
+            GtkAction {
+                name: String::from("count"),
+                target: Some(owned(Value::U32(3))),
+            },
+        );
+        button_actions.insert(
+            String::from("app.dismiss"),
+            GtkAction {
+                name: String::from("dismiss"),
+                target: None,
+            },
+        );
+
+        let source = NotificationSource::Gtk(GtkDispatch {
+            app_id: String::from("de.schmidhuberj.Flare"),
+            gtk_id: String::from("msg-7"),
+            default_action: Some(GtkAction {
+                name: String::from("notification-clicked"),
+                target: Some(owned(Value::new((5u8, vec![1u8, 2, 3])))),
+            }),
+            button_actions,
+        });
+
+        let NotificationSource::Gtk(dispatch) = deserialize_source(Some(serialize_source(&source)))
+        else {
+            panic!("expected a gtk source");
+        };
+
+        let default = dispatch.default_action.expect("default action preserved");
+        assert_eq!(default.name, "notification-clicked");
+        assert_eq!(
+            default.target.unwrap().value_signature().to_string(),
+            "(yay)"
+        );
+
+        let reply = dispatch
+            .button_actions
+            .get("app.reply")
+            .expect("reply button preserved");
+        assert_eq!(reply.name, "reply");
+        assert_eq!(
+            reply
+                .target
+                .as_ref()
+                .unwrap()
+                .downcast_ref::<String>()
+                .unwrap(),
+            "thread-9"
+        );
+
+        let mark = dispatch
+            .button_actions
+            .get("app.mark")
+            .expect("mark button preserved");
+        assert_eq!(
+            mark.target.as_ref().unwrap().value_signature().to_string(),
+            "(yay)"
+        );
+
+        let count = dispatch
+            .button_actions
+            .get("app.count")
+            .expect("count button preserved");
+        assert_eq!(
+            count.target.as_ref().unwrap().value_signature().to_string(),
+            "u"
+        );
+
+        let dismiss = dispatch
+            .button_actions
+            .get("app.dismiss")
+            .expect("dismiss button preserved");
+        assert!(dismiss.target.is_none());
+    }
+
+    /// Backward compatibility: targets persisted before the wire-format switch were
+    /// stored as `serde_json::to_string(&OwnedValue)`. `decode_target` must still read
+    /// those (for the scalar/string values that legacy path could round-trip) so an
+    /// upgrade doesn't silently drop targets from already-stored notifications.
+    #[test]
+    fn decode_target_reads_legacy_json_string_encoding() {
+        let legacy = serde_json::to_string(&OwnedValue::from(Str::from("chat-42")))
+            .expect("legacy encode succeeds");
+        // Sanity: the legacy form is the old object encoding, not the new byte array.
+        assert!(serde_json::from_str::<Vec<u8>>(&legacy).is_err());
+
+        let decoded = decode_target(&legacy).expect("legacy target still decodes");
+        assert_eq!(decoded.downcast_ref::<String>().unwrap(), "chat-42");
+    }
+
+    /// A `None` target must serialize away and come back `None` (a body click with no
+    /// default-action target dispatches a plain `Activate`, not `ActivateAction([])`).
+    #[test]
+    fn none_target_round_trips_as_none() {
+        let stored = stored_action(&GtkAction {
+            name: String::from("show"),
+            target: None,
+        });
+        assert!(stored.target.is_none());
+        let restored = gtk_action_from_stored(stored);
+        assert_eq!(restored.name, "show");
+        assert!(restored.target.is_none());
     }
 
     /// Serialize hints as `add()` does, then rebuild them as `load_all` does.
