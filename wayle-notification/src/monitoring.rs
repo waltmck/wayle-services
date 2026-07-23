@@ -10,16 +10,16 @@ use wayle_traits::ServiceMonitoring;
 use zbus::{Connection, fdo::DBusProxy};
 
 use crate::{
-    core::{notification::Notification, types::NotificationSource},
+    core::{
+        notification::Notification,
+        types::{Actions, NotificationId, Timeout},
+    },
     error::Error,
     events::NotificationEvent,
     persistence::NotificationStore,
     popup_timer::PopupTimerManager,
     service::NotificationService,
-    types::{
-        ClosedReason, Signal,
-        dbus::{SERVICE_INTERFACE, SERVICE_PATH},
-    },
+    types::ClosedReason,
 };
 
 impl ServiceMonitoring for NotificationService {
@@ -45,16 +45,49 @@ async fn handle_notifications(service: &NotificationService) -> Result<(), Error
     let notif_tx = service.notif_tx.clone();
     let popup_timers = service.popup_timers.clone();
 
+    // Notifications restored from disk are seeded straight into the list (they bypass the Add
+    // pipeline), so arm their history-expiry timers here — the same arming fresh adds get in
+    // handle_notification_added — otherwise a restored finite-timeout notification never expires.
+    for notif in notification_list.get() {
+        arm_history_expiry(&notif, &remove_expired, &notif_tx);
+    }
+
     tokio::spawn(async move {
+        // Best-effort proxy for the add-time reachability check below. If it can't be
+        // created, freshly-added notifications simply aren't re-checked here (the startup
+        // seed and the disconnect watcher still cover their cases).
+        let reachability_proxy = DBusProxy::new(&connection).await.ok();
+
         loop {
             tokio::select! {
                 _ = cancellation_token.cancelled() => {
                     info!("Notification monitoring cancelled, stopping");
                     return;
                 }
-                Ok(event) = event_receiver.recv() => {
+                event = event_receiver.recv() => {
+                    let event = match event {
+                        Ok(event) => event,
+                        // A refutable `Ok(event)` pattern would silently disable this branch on
+                        // Lagged/Closed — on Closed that busy-spins the loop. Handle both: warn on
+                        // lag (events were dropped, unreconstructible), and stop cleanly on close.
+                        Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                            warn!(skipped, "notification monitor lagged; some events were dropped");
+                            continue;
+                        }
+                        Err(broadcast::error::RecvError::Closed) => {
+                            info!("Notification event channel closed, stopping monitor");
+                            return;
+                        }
+                    };
                     match event {
                         NotificationEvent::Add(notif) => {
+                            // Gate on dispatch reachability BEFORE presenting: if the target
+                            // app is neither running nor D-Bus-activatable, a click could only
+                            // fail, so strip the actions up front — the card is then built
+                            // non-clickable and never flashes a broken click affordance.
+                            if let Some(proxy) = &reachability_proxy {
+                                strip_if_unreachable(&notif, proxy).await;
+                            }
                             handle_notification_added(
                                 &notif,
                                 &notification_list,
@@ -92,6 +125,11 @@ async fn handle_notifications(service: &NotificationService) -> Result<(), Error
                                 &popup_timers,
                             ).await;
                         }
+                        NotificationEvent::DismissPopup(id) => {
+                            dismiss_popup(id, &popup_list, &popup_timers);
+                        }
+                        NotificationEvent::InhibitPopup(id) => popup_timers.pause(id),
+                        NotificationEvent::ReleasePopup(id) => popup_timers.resume(id),
                     }
                 }
             }
@@ -108,13 +146,12 @@ async fn handle_notifications(service: &NotificationService) -> Result<(), Error
     Ok(())
 }
 
-/// Removes a notification's actions in place so it is no longer clickable.
-///
-/// `default_action` is cleared before `actions` so an observer watching only `actions`
-/// still sees a consistent (action-less) state by the time it reacts.
+/// Removes a notification's actions in place so it is no longer clickable — reset within a single
+/// atomic `view` update, so an observer sees a consistent action-less state.
 fn strip_actions(notif: &Notification) {
-    notif.default_action.set(None);
-    notif.actions.set(vec![]);
+    let mut view = notif.view.get();
+    view.actions = Actions::default();
+    notif.view.set(view);
 }
 
 /// Reactively strips a notification's actions once its dispatch target is unreachable and
@@ -172,29 +209,51 @@ fn spawn_owner_watching(
     });
 }
 
-/// Whether a notification's actions should be stripped given the currently-owned
-/// (`live`) and D-Bus-activatable (`activatable`) bus names.
+/// Strips a to-be-added notification's actions when its dispatch target is *already*
+/// unreachable, so the card is built non-clickable and never flashes a click that could only
+/// fail. Called before the notification is added to the history/popup lists (so the strip is
+/// captured when it is cloned into them) — closing the gap between the startup seed and the
+/// disconnect watcher, neither of which sees a freshly-delivered notification.
+///
+/// Only GTK notifications can be born undispatchable: an fdo notification's owner just called
+/// `Notify` (so it is alive), and a portal notification always routes through the persistent
+/// portal frontend. So the (two D-Bus round-trip) check is skipped for those. In practice a
+/// running `GApplication` owns its `app_id` bus name by the time it sends, so a real GTK
+/// notification is reachable here and this neither strips nor perceptibly delays it.
+async fn strip_if_unreachable(incoming: &Notification, dbus_proxy: &DBusProxy<'_>) {
+    // Only backends that can deliver an already-unreachable notification (GTK) pay for the
+    // reachability check at ingest; freedesktop (owner just called Notify) and portal (always
+    // reachable) skip it. The per-backend rule lives on the trait, not a match here.
+    if !incoming.dispatch.get().backend().may_be_unreachable_at_ingest() {
+        return;
+    }
+
+    let live = fetch_names(dbus_proxy).await;
+    let activatable = fetch_activatable_names(dbus_proxy).await;
+    if should_strip(incoming, &live, &activatable) {
+        strip_actions(incoming);
+        debug!(
+            id = %incoming.id,
+            "notification target unreachable; actions stripped before display"
+        );
+    }
+}
+
+/// Whether a notification's actions should be stripped given the currently-owned (`live`) and
+/// D-Bus-activatable (`activatable`) bus names — the per-backend rule lives on the [`Backend`]
+/// trait ([`Backend::is_unreachable`](crate::core::backend::Backend::is_unreachable)).
 fn should_strip(
     notif: &Notification,
     live: &HashSet<String>,
     activatable: &HashSet<String>,
 ) -> bool {
-    match notif.source.get() {
-        // freedesktop: the owning connection is the only dispatch target. If it's gone
-        // (or unknown), the actions can never fire again.
-        NotificationSource::Freedesktop => match notif.owner.get() {
-            Some(owner) => !live.contains(&owner),
-            None => true,
-        },
-        // GTK: dispatch is by app id, which stays reachable while the app runs OR if it
-        // can be cold-launched (activatable). Strip only when neither holds.
-        NotificationSource::Gtk(dispatch) => {
-            !live.contains(&dispatch.app_id) && !activatable.contains(&dispatch.app_id)
-        }
-    }
+    notif.dispatch.get().backend().is_unreachable(live, activatable)
 }
 
-/// Re-evaluates notifications whose dispatch target is the just-vanished bus name.
+/// Re-evaluates notifications when a bus name vanishes: if any notification's dispatch target is
+/// that name, refetch the live/activatable sets and strip everything now unreachable. The
+/// relevance check and the reachability rule are both the [`Backend`] trait's, so no protocol
+/// match happens here.
 async fn react_to_disconnect(
     dbus_proxy: &DBusProxy<'_>,
     notifications: &Property<Vec<Arc<Notification>>>,
@@ -204,39 +263,23 @@ async fn react_to_disconnect(
     let notifs = notifications.get();
     let pops = popups.get();
 
-    // freedesktop notifications owned by the vanished unique name die immediately. Note
-    // any GTK notification for the vanished app id: those need the (async) activatable
-    // check, which we do only if there's a match to judge.
-    let mut gtk_target_gone = false;
-    for notif in notifs.iter().chain(pops.iter()) {
-        match notif.source.get() {
-            NotificationSource::Freedesktop => {
-                if notif.owner.get().as_deref() == Some(vanished) {
-                    debug!(id = notif.id, name = %vanished, "owner disconnected, stripping actions");
-                    strip_actions(notif);
-                }
-            }
-            NotificationSource::Gtk(dispatch) => {
-                if dispatch.app_id == vanished {
-                    gtk_target_gone = true;
-                }
-            }
-        }
-    }
-
-    if !gtk_target_gone {
+    // Skip the (two-round-trip) reconciliation unless some notification actually dispatches to
+    // the vanished name.
+    let affected = notifs
+        .iter()
+        .chain(pops.iter())
+        .any(|notif| notif.dispatch.get().backend().dispatch_target() == Some(vanished));
+    if !affected {
         return;
     }
 
-    // The app exited; keep its notifications' actions only if it can be cold-launched.
-    if fetch_activatable_names(dbus_proxy).await.contains(vanished) {
-        return;
-    }
-
+    // Fetched *after* the disconnect, so `live` no longer contains `vanished`; a freedesktop
+    // owner or a non-activatable GTK app that just left is therefore judged unreachable.
+    let live = fetch_names(dbus_proxy).await;
+    let activatable = fetch_activatable_names(dbus_proxy).await;
     for notif in notifs.iter().chain(pops.iter()) {
-        if matches!(notif.source.get(), NotificationSource::Gtk(dispatch) if dispatch.app_id == vanished)
-        {
-            debug!(id = notif.id, app_id = %vanished, "gtk app gone and not activatable, stripping actions");
+        if should_strip(notif, &live, &activatable) {
+            debug!(id = %notif.id, name = %vanished, "dispatch target unreachable, stripping actions");
             strip_actions(notif);
         }
     }
@@ -262,6 +305,20 @@ async fn fetch_activatable_names(dbus_proxy: &DBusProxy<'_>) -> HashSet<String> 
     }
 }
 
+/// Removes a notification from the visible popups (keeping it in history) and cancels its
+/// popup timer — the popup-only counterpart to a full removal, driven by
+/// [`Notification::dismiss_popup`].
+fn dismiss_popup(
+    id: NotificationId,
+    popups: &Property<Vec<Arc<Notification>>>,
+    popup_timers: &Arc<PopupTimerManager>,
+) {
+    popup_timers.cancel(id);
+    let mut list = popups.get();
+    list.retain(|popup| popup.id != id);
+    popups.set(list);
+}
+
 fn handle_popup_added(
     incoming_popup: &Notification,
     popups: &Property<Vec<Arc<Notification>>>,
@@ -281,7 +338,6 @@ fn handle_popup_added(
     let popup = match list.iter().find(|popup| popup.id == incoming_popup.id).cloned() {
         Some(existing) => {
             existing.update_from(incoming_popup);
-            existing.owner.set(incoming_popup.owner.get());
             existing
         }
         None => Arc::new(incoming_popup.clone()),
@@ -293,13 +349,12 @@ fn handle_popup_added(
 
     let default_duration = Duration::from_millis(popup_duration.get() as u64);
 
-    match popup.expire_timeout.get() {
-        Some(0) => {}
-        Some(ttl) => {
-            let expire = Duration::from_millis(ttl as u64);
-            popup_timers.start(popup.id, default_duration.min(expire));
-        }
-        None => {
+    // The banner always auto-hides (it stays in history); only the app's explicit
+    // never-expire suppresses the timer. A finite request is clamped to the default.
+    match popup.view.get().lifecycle.timeout {
+        Timeout::NeverByApp => {}
+        Timeout::After(ttl) => popup_timers.start(popup.id, default_duration.min(ttl)),
+        Timeout::ServerDefault | Timeout::PersistentByBackend => {
             popup_timers.start(popup.id, default_duration);
         }
     }
@@ -316,7 +371,7 @@ fn handle_notification_added(
 
     // Transient notifications are not kept in history. If a notification is flipped to
     // transient over an existing id, drop the stale history entry so it leaves history.
-    if incoming_notif.is_transient.get() {
+    if incoming_notif.view.get().classification.transient {
         if list.iter().any(|notif| notif.id == incoming_notif.id) {
             list.retain(|notif| notif.id != incoming_notif.id);
             notifications.replace(list);
@@ -331,22 +386,22 @@ fn handle_notification_added(
     // Property fields) rather than replacing its Arc; only mint a new Arc for a new id.
     let notif_arc = match list.iter().find(|notif| notif.id == incoming_notif.id).cloned() {
         Some(existing) => {
+            // `update_from` replaces the whole dispatch, which now carries the owner, so an app
+            // that reconnected and replaced its own notification has its directed-signal target
+            // refreshed automatically.
             existing.update_from(incoming_notif);
-            // Refresh the owning connection (e.g. an app that reconnected and replaced
-            // its own notification) so directed signals reach the live client.
-            existing.owner.set(incoming_notif.owner.get());
             debug!(
-                id = existing.id,
-                app = ?existing.app_name.get(),
+                id = %existing.id,
+                app = ?existing.view.get().origin.name,
                 "updating existing notification in place"
             );
             existing
         }
         None => {
             debug!(
-                id = incoming_notif.id,
-                app = ?incoming_notif.app_name.get(),
-                summary = %incoming_notif.summary.get(),
+                id = %incoming_notif.id,
+                app = ?incoming_notif.view.get().origin.name,
+                summary = %incoming_notif.view.get().content.summary,
                 list_size = list.len(),
                 "adding new notification"
             );
@@ -363,26 +418,43 @@ fn handle_notification_added(
         let _ = store.add(incoming_notif);
     };
 
+    arm_history_expiry(&notif_arc, remove_expired, notif_tx);
+}
+
+/// Arms the history-expiry timer for a notification with an explicit finite timeout (or removes
+/// it immediately if already past its deadline). No-op unless `remove_expired` is set and the
+/// timeout is [`Timeout::After`]. Shared by fresh adds ([`handle_notification_added`]) and the
+/// startup pass over notifications restored from disk, so a restored notification expires on the
+/// same schedule as a freshly-received one instead of lingering in history until dismissed.
+fn arm_history_expiry(
+    notif: &Arc<Notification>,
+    remove_expired: &Property<bool>,
+    notif_tx: &broadcast::Sender<NotificationEvent>,
+) {
     if !remove_expired.get() {
         return;
     }
 
-    let Some(ttl) = notif_arc.expire_timeout.get() else {
+    // Only an explicit finite timeout auto-removes from history; server-default and the
+    // backend-persistent / never-by-app cases stay until dismissed (the banner still hides).
+    let Timeout::After(ttl) = notif.view.get().lifecycle.timeout else {
         return;
     };
 
-    let expiration_time = notif_arc.timestamp.get() + Duration::from_millis(ttl as u64);
-    let now = Utc::now();
+    let expiration_time = notif.view.get().received + ttl;
+    let id = notif.id;
 
-    if expiration_time <= now {
-        let mut list = notifications.get();
-        list.retain(|notif| notif.id != notif_arc.id);
-        notifications.set(list);
-        return;
-    }
-
-    let time_until_expiration = (expiration_time - now).to_std().unwrap_or(Duration::ZERO);
-    let id = notif_arc.id;
+    // All expiry — already-past or future — is delivered through the normal `Remove` event from a
+    // spawned timer task, so it drops from BOTH the live list and the store (and emits any
+    // close-back signal) via the one removal path. A past deadline yields a zero-length sleep, so
+    // even then the send happens asynchronously AFTER this (synchronous) arming pass returns and
+    // the event loop is draining — never a synchronous burst into the broadcast channel before any
+    // receiver runs. This also closes the startup race: a finite notification whose deadline passes
+    // between the persistence load snapshot and arming was still loaded (kept in the store), so
+    // removing it here deletes it from the store too — it is never orphaned.
+    let time_until_expiration = (expiration_time - Utc::now())
+        .to_std()
+        .unwrap_or(Duration::ZERO);
     let tx = notif_tx.clone();
 
     tokio::spawn(async move {
@@ -392,7 +464,7 @@ fn handle_notification_added(
 }
 
 async fn handle_notification_removed(
-    id: u32,
+    id: NotificationId,
     reason: ClosedReason,
     notifications: &Property<Vec<Arc<Notification>>>,
     popups: &Property<Vec<Arc<Notification>>>,
@@ -410,12 +482,10 @@ async fn handle_notification_removed(
 
     let mut notif_list = notifications.get();
     let prev_len = notif_list.len();
-    // Capture the owner before removing the notification from the list, so the close
-    // signal can be directed to the creating connection.
-    let owner = notif_list
-        .iter()
-        .find(|notif| notif.id == id)
-        .and_then(|notif| notif.owner.get());
+    // Keep the removed notification so its backend can emit any close-back signal (freedesktop
+    // directs `NotificationClosed(wire_id, reason)` to its owner; GTK/portal no-op). The core
+    // never matches on the protocol — it forwards through the `Backend` trait.
+    let removed = notif_list.iter().find(|notif| notif.id == id).cloned();
     notif_list.retain(|notif| notif.id != id);
 
     if notif_list.len() == prev_len {
@@ -428,24 +498,11 @@ async fn handle_notification_removed(
         let _ = store.remove(id);
     };
 
-    // Direct the close signal to the owning connection only; skip if unknown, for the
-    // same reason as ActionInvoked (a broadcast reaches clients that don't filter by id).
-    let Some(owner) = owner else {
-        return;
-    };
-
-    debug!(id = id, ?reason, "emitting NotificationClosed");
-    if let Err(err) = connection
-        .emit_signal(
-            Some(owner.as_str()),
-            SERVICE_PATH,
-            SERVICE_INTERFACE,
-            Signal::NotificationClosed.as_str(),
-            &(id, reason as u32),
-        )
-        .await
-    {
-        warn!(id = id, error = %err, "cannot emit NotificationClosed signal");
+    if let Some(notif) = removed {
+        let dispatch = notif.dispatch.get();
+        if let Err(err) = dispatch.backend().close(connection, reason).await {
+            warn!(id = %id, error = %err, "cannot emit close signal");
+        }
     }
 }
 
@@ -456,7 +513,7 @@ async fn handle_notification_removed(
 /// told about its own id (directed to its owner; GTK notifications have no owner and no
 /// close signal, so they're skipped).
 async fn handle_notifications_removed_batch(
-    ids: Vec<u32>,
+    ids: Vec<NotificationId>,
     reason: ClosedReason,
     notifications: &Property<Vec<Arc<Notification>>>,
     popups: &Property<Vec<Arc<Notification>>>,
@@ -467,7 +524,7 @@ async fn handle_notifications_removed_batch(
     if ids.is_empty() {
         return;
     }
-    let id_set: HashSet<u32> = ids.iter().copied().collect();
+    let id_set: HashSet<NotificationId> = ids.iter().copied().collect();
 
     // Drop all matched popups (and cancel their timers) in one update, mirroring the
     // single-removal rule that expiry leaves popups untouched.
@@ -480,13 +537,13 @@ async fn handle_notifications_removed_batch(
         popups.set(popup_list);
     }
 
-    // Capture owners before removal so the close signals can be directed, then drop all
-    // matched notifications from history in a single update.
+    // Keep the removed notifications so each backend can emit its own close-back signal after the
+    // single list update, then drop them all from history at once.
     let mut notif_list = notifications.get();
-    let removed: Vec<(u32, Option<String>)> = notif_list
+    let removed: Vec<Arc<Notification>> = notif_list
         .iter()
         .filter(|notif| id_set.contains(&notif.id))
-        .map(|notif| (notif.id, notif.owner.get()))
+        .cloned()
         .collect();
     if removed.is_empty() {
         return;
@@ -495,26 +552,15 @@ async fn handle_notifications_removed_batch(
     notifications.set(notif_list);
 
     if let Some(store) = store.as_ref() {
-        let removed_ids: Vec<u32> = removed.iter().map(|(id, _)| *id).collect();
+        let removed_ids: Vec<NotificationId> = removed.iter().map(|notif| notif.id).collect();
         let _ = store.remove_many(&removed_ids);
     }
 
-    for (id, owner) in removed {
-        let Some(owner) = owner else {
-            continue;
-        };
-        debug!(id = id, ?reason, "emitting NotificationClosed");
-        if let Err(err) = connection
-            .emit_signal(
-                Some(owner.as_str()),
-                SERVICE_PATH,
-                SERVICE_INTERFACE,
-                Signal::NotificationClosed.as_str(),
-                &(id, reason as u32),
-            )
-            .await
-        {
-            warn!(id = id, error = %err, "cannot emit NotificationClosed signal");
+    // Each fdo entry is told about its own id (directed to its owner); GTK/portal no-op.
+    for notif in removed {
+        let dispatch = notif.dispatch.get();
+        if let Err(err) = dispatch.backend().close(connection, reason).await {
+            warn!(id = %notif.id, error = %err, "cannot emit close signal");
         }
     }
 }

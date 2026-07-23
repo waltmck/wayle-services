@@ -22,7 +22,10 @@ pub(crate) type SpecVersion = String;
 pub(crate) enum Signal {
     NotificationClosed,
     ActionInvoked,
-    #[allow(dead_code)]
+    /// KDE inline-reply result: `NotificationReplied(u id, s text)`.
+    NotificationReplied,
+    /// freedesktop `ActivationToken(u id, s token)` — the focus token, emitted before
+    /// `ActionInvoked` so the app may raise its window (see the freedesktop backend).
     ActivationToken,
 }
 
@@ -31,6 +34,7 @@ impl Signal {
         match self {
             Signal::NotificationClosed => "NotificationClosed",
             Signal::ActionInvoked => "ActionInvoked",
+            Signal::NotificationReplied => "NotificationReplied",
             Signal::ActivationToken => "ActivationToken",
         }
     }

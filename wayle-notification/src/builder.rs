@@ -1,9 +1,5 @@
-use std::{
-    collections::HashMap,
-    sync::{Arc, Mutex},
-};
+use std::{collections::HashSet, sync::Arc};
 
-use chrono::{DateTime, Utc};
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
@@ -12,14 +8,14 @@ use wayle_traits::ServiceMonitoring;
 use zbus::{Connection, object_server::Interface};
 
 use crate::{
+    backends::{freedesktop::FdoNotificationDaemon, gtk::GtkNotificationsDaemon},
     core::{
         notification::Notification,
-        types::{NotificationProps, NotificationSource},
+        types::{Alert, Image},
     },
-    daemon::{IdCounter, NotificationDaemon},
     error::Error,
     events::NotificationEvent,
-    gtk_daemon::GtkNotificationsDaemon,
+    image_cache,
     persistence::{NotificationStore, StoredNotification},
     popup_timer::PopupTimerManager,
     service::NotificationService,
@@ -120,74 +116,52 @@ impl NotificationServiceBuilder {
 
         let store = init_store();
 
-        // Owner unique names are only valid within a single session bus lifetime.
-        // Compare the current bus GUID to the one recorded with the persisted
-        // notifications; if they differ (or can't be determined), the restored owners
-        // are from a prior session and must not be used to direct signals.
-        let current_bus_guid = match zbus::fdo::DBusProxy::new(&connection).await {
+        // The current session bus GUID stamps each freedesktop notification's dispatch, so a
+        // restart can tell which restored notifications belong to this session (wire ids and
+        // owners still live) versus a prior one (history only). Empty if it can't be read,
+        // which no persisted session id matches, so those owners are treated as stale.
+        let session_id = match zbus::fdo::DBusProxy::new(&connection).await {
             Ok(proxy) => match proxy.get_id().await {
-                Ok(guid) => Some(guid.to_string()),
+                Ok(guid) => guid.to_string(),
                 Err(err) => {
                     warn!(error = %err, "cannot read session bus GUID; treating persisted owners as stale");
-                    None
+                    String::new()
                 }
             },
             Err(err) => {
                 warn!(error = %err, "cannot create DBus proxy; treating persisted owners as stale");
-                None
+                String::new()
             }
         };
-        let stored_bus_guid = store
-            .as_ref()
-            .and_then(|store| store.bus_guid().ok().flatten());
-        let same_session = current_bus_guid.is_some() && current_bus_guid == stored_bus_guid;
 
-        let stored_notifications = load_stored_notifications(
-            &store,
-            self.remove_expired.get(),
-            &connection,
-            &notif_tx,
-            same_session,
+        let stored_notifications =
+            load_stored_notifications(&store, self.remove_expired.get(), &connection, &notif_tx);
+
+        // Drop cached image/sound blobs no longer referenced by any restored notification,
+        // bounding the content-addressed cache (a dropped blob is re-created on demand).
+        let mut referenced = HashSet::new();
+        for notif in &stored_notifications {
+            if let Some(Image::Path(path)) = notif.view.get().origin.icon {
+                referenced.insert(path);
+            }
+            if let Some(Image::Path(path)) = notif.view.get().image {
+                referenced.insert(path);
+            }
+            if let Alert::File(path) = notif.view.get().alert {
+                referenced.insert(path);
+            }
+        }
+        image_cache::prune(&referenced);
+
+        // The freedesktop backend re-establishes its own wire-id space (coalescing slots, wire
+        // counter, stale-session owner clearing) from the restored notifications.
+        let freedesktop_daemon = FdoNotificationDaemon::new(
+            connection.clone(),
+            notif_tx.clone(),
+            self.blocklist.clone(),
+            session_id,
+            &stored_notifications,
         );
-
-        if let (Some(store), Some(guid)) = (store.as_ref(), current_bus_guid.as_ref())
-            && let Err(err) = store.record_bus_guid(guid)
-        {
-            warn!(error = %err, "cannot record session bus GUID");
-        }
-        let max_id = stored_notifications
-            .iter()
-            .map(|notif| notif.id)
-            .max()
-            .unwrap_or(0);
-        // Resume the id counter above the highest id ever issued, not just the max
-        // surviving notification. Transient/dismissed notifications had ids handed to
-        // long-lived clients; if the counter rewound below them and reissued one, an
-        // action invoked on the new notification would reach the wrong, stale client.
-        let high_water = store
-            .as_ref()
-            .and_then(|store| store.id_high_water().ok())
-            .unwrap_or(0);
-        let counter_start = max_id.max(high_water).saturating_add(1);
-
-        let mut initial_owners = HashMap::new();
-        for notification in &stored_notifications {
-            if let Some(app_name) = notification.app_name.get() {
-                initial_owners.insert(notification.id, app_name);
-            }
-        }
-
-        // Shared by both daemons so freedesktop and GTK notifications never collide on an
-        // id (and both advance the same persisted high-water mark).
-        let id_counter = Arc::new(IdCounter::new(counter_start, store.clone()));
-
-        let freedesktop_daemon = NotificationDaemon {
-            id_counter: Arc::clone(&id_counter),
-            zbus_connection: connection.clone(),
-            notif_tx: notif_tx.clone(),
-            blocklist: self.blocklist.clone(),
-            id_owners: Mutex::new(initial_owners),
-        };
 
         register_dbus_object(&connection, SERVICE_PATH, freedesktop_daemon).await?;
         register_dbus_name(&connection, SERVICE_NAME).await?;
@@ -197,19 +171,12 @@ impl NotificationServiceBuilder {
         // apps route here and get persistent, cold-launchable actions. Best-effort: if the
         // name can't be acquired (e.g. another daemon owns it), log and carry on rather
         // than failing the whole service.
-        let mut gtk_keys = HashMap::new();
-        for notification in &stored_notifications {
-            if let NotificationSource::Gtk(dispatch) = notification.source.get() {
-                gtk_keys.insert((dispatch.app_id, dispatch.gtk_id), notification.id);
-            }
-        }
-        let gtk_daemon = GtkNotificationsDaemon {
-            id_counter: Arc::clone(&id_counter),
-            zbus_connection: connection.clone(),
-            notif_tx: notif_tx.clone(),
-            blocklist: self.blocklist.clone(),
-            keys: Mutex::new(gtk_keys),
-        };
+        let gtk_daemon = GtkNotificationsDaemon::new(
+            connection.clone(),
+            notif_tx.clone(),
+            self.blocklist.clone(),
+            &stored_notifications,
+        );
         register_dbus_object(&connection, GTK_SERVICE_PATH, gtk_daemon).await?;
         match register_dbus_name(&connection, GTK_SERVICE_NAME).await {
             Ok(()) => info!("GTK notification bridge registered at {GTK_SERVICE_NAME}"),
@@ -267,7 +234,6 @@ fn load_stored_notifications(
     remove_expired: bool,
     connection: &Connection,
     notif_tx: &broadcast::Sender<NotificationEvent>,
-    keep_owners: bool,
 ) -> Vec<Arc<Notification>> {
     store
         .as_ref()
@@ -276,12 +242,7 @@ fn load_stored_notifications(
             stored
                 .into_iter()
                 .map(|notification| {
-                    stored_to_notification(
-                        notification,
-                        connection.clone(),
-                        notif_tx.clone(),
-                        keep_owners,
-                    )
+                    stored_to_notification(notification, connection.clone(), notif_tx.clone())
                 })
                 .collect()
         })
@@ -292,27 +253,8 @@ fn stored_to_notification(
     stored: StoredNotification,
     connection: Connection,
     notif_tx: broadcast::Sender<NotificationEvent>,
-    keep_owner: bool,
 ) -> Arc<Notification> {
-    Arc::new(Notification::new(
-        NotificationProps {
-            id: stored.id,
-            app_name: stored.app_name.unwrap_or_default(),
-            replaces_id: stored.replaces_id.unwrap_or(0),
-            app_icon: stored.app_icon.unwrap_or_default(),
-            summary: stored.summary,
-            body: stored.body.unwrap_or_default(),
-            actions: stored.actions,
-            hints: stored.hints,
-            expire_timeout: stored.expire_timeout.unwrap_or(0) as i32,
-            timestamp: DateTime::<Utc>::from_timestamp_millis(stored.timestamp)
-                .unwrap_or_else(Utc::now),
-            owner: if keep_owner { stored.owner } else { None },
-            source: stored.source,
-        },
-        connection,
-        notif_tx,
-    ))
+    Arc::new(Notification::from_stored(stored, connection, notif_tx))
 }
 
 async fn register_dbus_object<T: Interface>(

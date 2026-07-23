@@ -2,16 +2,15 @@ use std::{
     collections::HashMap,
     env, fs,
     sync::{Arc, Mutex},
-    time::Duration,
 };
 
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use derive_more::Debug;
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, instrument, warn};
 use zbus::zvariant::{
-    LE, OwnedValue, Str, Value,
+    LE, OwnedValue, Value,
     serialized::{Context, Data},
     to_bytes,
 };
@@ -19,83 +18,133 @@ use zbus::zvariant::{
 use crate::{
     core::{
         notification::Notification,
-        types::{Action, GtkAction, GtkDispatch, IMAGE_DATA_KEYS, NotificationSource},
+        types::{
+            Actions, Alert, Classification, Content, FreedesktopDispatch, GtkAction, GtkDispatch,
+            Image, Lifecycle, NotificationId, NotificationSource, Origin, PortalAction,
+            PortalDispatch, Presentation, Timeout,
+        },
     },
     error::Error,
+    types::{ButtonPurpose, ClosedReason},
 };
 
-#[derive(Debug)]
+/// On-disk form of a [`Notification`]. The display facets serialize verbatim (they are plain,
+/// transport-free data); only the `dispatch` needs special handling, because its action
+/// targets are arbitrary GVariants that don't survive a naive JSON round-trip — those go
+/// through [`StoredSource`]. The whole struct is persisted as a single JSON blob, so adding a
+/// facet field never needs a schema migration.
+#[derive(Serialize, Deserialize)]
 pub(crate) struct StoredNotification {
-    pub id: u32,
-    pub app_name: Option<String>,
-    pub replaces_id: Option<u32>,
-    pub app_icon: Option<String>,
-    pub summary: String,
-    pub body: Option<String>,
-    pub actions: Vec<String>,
-    pub hints: HashMap<String, OwnedValue>,
-    pub image_path: Option<String>,
-    pub expire_timeout: Option<u32>,
-    pub timestamp: i64,
-    pub owner: Option<String>,
-    pub source: NotificationSource,
+    pub id: NotificationId,
+    pub received_ms: i64,
+    #[serde(default)]
+    pub close_reason: Option<ClosedReason>,
+    pub origin: Origin,
+    pub content: Content,
+    #[serde(default)]
+    pub image: Option<Image>,
+    pub actions: Actions,
+    #[serde(default)]
+    pub alert: Alert,
+    pub classification: Classification,
+    pub lifecycle: Lifecycle,
+    pub presentation: Presentation,
+    pub dispatch: StoredSource,
 }
 
 impl From<&Notification> for StoredNotification {
     fn from(notification: &Notification) -> Self {
+        let view = notification.view.get();
         Self {
             id: notification.id,
-            app_name: notification.app_name.get().clone(),
-            replaces_id: notification.replaces_id.get(),
-            app_icon: notification.app_icon.get().clone(),
-            summary: notification.summary.get().clone(),
-            body: notification.body.get().clone(),
-            actions: Action::to_dbus_format(&notification.actions.get()),
-            hints: notification.hints.get().clone().unwrap_or_default(),
-            image_path: notification.image_path.get().clone(),
-            expire_timeout: notification.expire_timeout.get(),
-            timestamp: notification.timestamp.get().timestamp_millis(),
-            owner: notification.owner.get(),
-            source: notification.source.get(),
+            received_ms: view.received.timestamp_millis(),
+            close_reason: view.close_reason,
+            origin: view.origin,
+            content: view.content,
+            image: view.image,
+            actions: view.actions,
+            alert: view.alert,
+            classification: view.classification,
+            lifecycle: view.lifecycle,
+            presentation: view.presentation,
+            dispatch: stored_source(&notification.dispatch.get()),
         }
     }
 }
 
 /// On-disk form of [`NotificationSource`]. Kept separate from the runtime type so action
-/// targets serialize through the same `serde_json::Value` round-trip proven to work for
-/// `OwnedValue` hints.
+/// targets serialize through the wire-format encoding proven to round-trip arbitrary
+/// `OwnedValue`s (see [`encode_target`]).
 #[derive(Serialize, Deserialize)]
-struct StoredSource {
+pub(crate) struct StoredSource {
     kind: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    fdo: Option<StoredFdoDispatch>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     gtk: Option<StoredGtkDispatch>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    portal: Option<StoredPortalDispatch>,
+}
+
+#[derive(Serialize, Deserialize, Default)]
+struct StoredFdoDispatch {
+    wire_id: u32,
+    /// The session bus GUID this notification was created under, so a restart can tell whether
+    /// its wire id + owner still belong to the live session.
+    #[serde(default)]
+    session_id: String,
+    /// The owning connection's unique name (directed-signal target). Restored as-is; the daemon
+    /// clears it at startup when `session_id` differs from the current bus (a prior session).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    owner: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
 struct StoredGtkDispatch {
     app_id: String,
     gtk_id: String,
-    default_action: Option<StoredGtkAction>,
-    button_actions: HashMap<String, StoredGtkAction>,
+    default_action: Option<StoredAction>,
+    button_actions: HashMap<String, StoredAction>,
 }
 
 #[derive(Serialize, Deserialize)]
-struct StoredGtkAction {
+struct StoredPortalDispatch {
+    app_id: String,
+    portal_id: String,
+    default_action: Option<StoredAction>,
+    button_actions: HashMap<String, StoredAction>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reply_action: Option<StoredAction>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct StoredAction {
     name: String,
     /// The action target, stored as its D-Bus wire encoding (a self-describing variant)
     /// held as a JSON byte array. See [`encode_target`] for why the encoding is bytes and
     /// not `serde_json` of the `OwnedValue` directly.
     target: Option<String>,
+    /// The button purpose string (portal only). Defaulted for rows written before it
+    /// existed, and for GTK actions which have no purpose.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    purpose: Option<String>,
 }
 
-fn serialize_source(source: &NotificationSource) -> String {
-    let stored = match source {
-        NotificationSource::Freedesktop => StoredSource {
+fn stored_source(source: &NotificationSource) -> StoredSource {
+    match source {
+        NotificationSource::Freedesktop(dispatch) => StoredSource {
             kind: String::from("fdo"),
+            fdo: Some(StoredFdoDispatch {
+                wire_id: dispatch.wire_id,
+                session_id: dispatch.session_id.clone(),
+                owner: dispatch.owner.clone(),
+            }),
             gtk: None,
+            portal: None,
         },
         NotificationSource::Gtk(dispatch) => StoredSource {
             kind: String::from("gtk"),
+            fdo: None,
             gtk: Some(StoredGtkDispatch {
                 app_id: dispatch.app_id.clone(),
                 gtk_id: dispatch.gtk_id.clone(),
@@ -106,24 +155,30 @@ fn serialize_source(source: &NotificationSource) -> String {
                     .map(|(key, action)| (key.clone(), stored_action(action)))
                     .collect(),
             }),
+            portal: None,
         },
-    };
-    serde_json::to_string(&stored).unwrap_or_else(|err| {
-        warn!(error = %err, "cannot serialize notification source");
-        String::from(r#"{"kind":"fdo"}"#)
-    })
+        NotificationSource::Portal(dispatch) => StoredSource {
+            kind: String::from("portal"),
+            fdo: None,
+            gtk: None,
+            portal: Some(StoredPortalDispatch {
+                app_id: dispatch.app_id.clone(),
+                portal_id: dispatch.portal_id.clone(),
+                default_action: dispatch.default_action.as_ref().map(stored_portal_action),
+                button_actions: dispatch
+                    .button_actions
+                    .iter()
+                    .map(|(key, action)| (key.clone(), stored_portal_action(action)))
+                    .collect(),
+                reply_action: dispatch.reply_action.as_ref().map(stored_portal_action),
+            }),
+        },
+    }
 }
 
-fn deserialize_source(raw: Option<String>) -> NotificationSource {
-    let Some(raw) = raw else {
-        return NotificationSource::Freedesktop;
-    };
-    let Ok(stored) = serde_json::from_str::<StoredSource>(&raw) else {
-        warn!("cannot deserialize notification source; treating as freedesktop");
-        return NotificationSource::Freedesktop;
-    };
-    match (stored.kind.as_str(), stored.gtk) {
-        ("gtk", Some(gtk)) => NotificationSource::Gtk(GtkDispatch {
+pub(crate) fn source_from_stored(stored: StoredSource) -> NotificationSource {
+    match (stored.kind.as_str(), stored.gtk, stored.portal) {
+        ("gtk", Some(gtk), _) => NotificationSource::Gtk(GtkDispatch {
             app_id: gtk.app_id,
             gtk_id: gtk.gtk_id,
             default_action: gtk.default_action.map(gtk_action_from_stored),
@@ -133,21 +188,62 @@ fn deserialize_source(raw: Option<String>) -> NotificationSource {
                 .map(|(key, action)| (key, gtk_action_from_stored(action)))
                 .collect(),
         }),
-        _ => NotificationSource::Freedesktop,
+        ("portal", _, Some(portal)) => NotificationSource::Portal(PortalDispatch {
+            app_id: portal.app_id,
+            portal_id: portal.portal_id,
+            default_action: portal.default_action.map(portal_action_from_stored),
+            button_actions: portal
+                .button_actions
+                .into_iter()
+                .map(|(key, action)| (key, portal_action_from_stored(action)))
+                .collect(),
+            reply_action: portal.reply_action.map(portal_action_from_stored),
+        }),
+        // Freedesktop, or any legacy/unknown row: restore the wire id + session if present,
+        // else a default (inert) dispatch.
+        _ => {
+            let fdo = stored.fdo.unwrap_or_default();
+            NotificationSource::Freedesktop(FreedesktopDispatch {
+                wire_id: fdo.wire_id,
+                session_id: fdo.session_id,
+                owner: fdo.owner,
+            })
+        }
     }
 }
 
-fn stored_action(action: &GtkAction) -> StoredGtkAction {
-    StoredGtkAction {
+fn stored_action(action: &GtkAction) -> StoredAction {
+    StoredAction {
         name: action.name.clone(),
         target: action.target.as_ref().and_then(encode_target),
+        // GTK actions have no button purpose.
+        purpose: None,
     }
 }
 
-fn gtk_action_from_stored(stored: StoredGtkAction) -> GtkAction {
+fn gtk_action_from_stored(stored: StoredAction) -> GtkAction {
     GtkAction {
         name: stored.name,
         target: stored.target.as_deref().and_then(decode_target),
+    }
+}
+
+fn stored_portal_action(action: &PortalAction) -> StoredAction {
+    StoredAction {
+        name: action.name.clone(),
+        target: action.target.as_ref().and_then(encode_target),
+        purpose: action.purpose.as_ref().map(|purpose| purpose.as_str().to_owned()),
+    }
+}
+
+fn portal_action_from_stored(stored: StoredAction) -> PortalAction {
+    PortalAction {
+        name: stored.name,
+        target: stored.target.as_deref().and_then(decode_target),
+        purpose: stored
+            .purpose
+            .as_deref()
+            .and_then(|purpose| purpose.parse::<ButtonPurpose>().ok()),
     }
 }
 
@@ -201,86 +297,51 @@ impl NotificationStore {
         let connection = Connection::open(db_path)
             .map_err(|err| Error::DatabaseError(format!("cannot open database: {err}")))?;
 
+        Self::configure(&connection)?;
+
+        Ok(Self {
+            connection: Arc::new(Mutex::new(connection)),
+        })
+    }
+
+    /// Migrates (if needed) and creates the schema on a freshly-opened connection. Split out from
+    /// [`new`](Self::new) so tests can drive it against an in-memory database.
+    fn configure(connection: &Connection) -> Result<(), Error> {
+        // An older database is dropped and recreated when its columns don't match the current
+        // schema — either the pre-facet wide layout (no `data` blob column) or a pre-`expires_at`
+        // layout (before the deadline column that drives downtime-expiry reaping). Persisted
+        // notifications are ephemeral, so losing a session's history on upgrade is acceptable.
+        let columns: Vec<String> = {
+            let mut stmt = connection
+                .prepare("PRAGMA table_info(notifications)")
+                .map_err(|err| Error::DatabaseError(format!("cannot inspect schema: {err}")))?;
+            let columns = stmt
+                .query_map([], |row| row.get::<_, String>(1))
+                .map_err(|err| Error::DatabaseError(format!("cannot read schema: {err}")))?;
+            columns.filter_map(Result::ok).collect()
+        };
+        let has_column = |name: &str| columns.iter().any(|column| column == name);
+        if !columns.is_empty() && (!has_column("data") || !has_column("expires_at")) {
+            connection
+                .execute("DROP TABLE notifications", [])
+                .map_err(|err| Error::DatabaseError(format!("cannot drop legacy table: {err}")))?;
+        }
+
+        // `expires_at` is the absolute wall-clock deadline (ms since epoch) for a finite-timeout
+        // notification, or NULL when it never auto-expires (server-default / never-by-app /
+        // backend-persistent). Storing the resolved deadline as a column lets the downtime reap
+        // and the load filter be plain SQL comparisons rather than parsing every JSON blob.
         connection
             .execute(
                 "CREATE TABLE IF NOT EXISTS notifications (
                     id INTEGER PRIMARY KEY,
-                    app_name TEXT,
-                    replaces_id INTEGER,
-                    app_icon TEXT,
-                    summary TEXT NOT NULL,
-                    body TEXT,
-                    actions TEXT NOT NULL,
-                    hints TEXT NOT NULL,
-                    expire_timeout INTEGER,
                     timestamp INTEGER NOT NULL,
-                    image_path TEXT,
-                    owner TEXT,
-                    source TEXT
+                    expires_at INTEGER,
+                    data TEXT NOT NULL
                 )",
                 [],
             )
             .map_err(|err| Error::DatabaseError(format!("cannot create table: {err}")))?;
-
-        // Migrate pre-existing databases that lack the `owner` column (CREATE TABLE IF
-        // NOT EXISTS won't add it, and SQLite has no ADD COLUMN IF NOT EXISTS).
-        let has_owner_column = {
-            let mut stmt = connection
-                .prepare("PRAGMA table_info(notifications)")
-                .map_err(|err| Error::DatabaseError(format!("cannot inspect schema: {err}")))?;
-            let columns = stmt
-                .query_map([], |row| row.get::<_, String>(1))
-                .map_err(|err| Error::DatabaseError(format!("cannot read schema: {err}")))?;
-            columns
-                .filter_map(Result::ok)
-                .any(|column| column == "owner")
-        };
-        if !has_owner_column {
-            connection
-                .execute("ALTER TABLE notifications ADD COLUMN owner TEXT", [])
-                .map_err(|err| Error::DatabaseError(format!("cannot add owner column: {err}")))?;
-        }
-
-        // Likewise migrate databases that predate the `source` column (freedesktop vs GTK
-        // origin + GTK action-dispatch data). Rows without it read back as freedesktop.
-        let has_source_column = {
-            let mut stmt = connection
-                .prepare("PRAGMA table_info(notifications)")
-                .map_err(|err| Error::DatabaseError(format!("cannot inspect schema: {err}")))?;
-            let columns = stmt
-                .query_map([], |row| row.get::<_, String>(1))
-                .map_err(|err| Error::DatabaseError(format!("cannot read schema: {err}")))?;
-            columns
-                .filter_map(Result::ok)
-                .any(|column| column == "source")
-        };
-        if !has_source_column {
-            connection
-                .execute("ALTER TABLE notifications ADD COLUMN source TEXT", [])
-                .map_err(|err| Error::DatabaseError(format!("cannot add source column: {err}")))?;
-        }
-
-        connection
-            .execute(
-                "CREATE TABLE IF NOT EXISTS metadata (
-                    key TEXT PRIMARY KEY,
-                    value INTEGER NOT NULL
-                )",
-                [],
-            )
-            .map_err(|err| Error::DatabaseError(format!("cannot create metadata table: {err}")))?;
-
-        connection
-            .execute(
-                "CREATE TABLE IF NOT EXISTS metadata_text (
-                    key TEXT PRIMARY KEY,
-                    value TEXT NOT NULL
-                )",
-                [],
-            )
-            .map_err(|err| {
-                Error::DatabaseError(format!("cannot create metadata_text table: {err}"))
-            })?;
 
         connection
             .execute_batch(
@@ -289,136 +350,42 @@ impl NotificationStore {
             )
             .map_err(|err| Error::DatabaseError(format!("cannot set pragmas: {err}")))?;
 
-        Ok(Self {
-            connection: Arc::new(Mutex::new(connection)),
-        })
-    }
-
-    /// Highest notification id ever issued.
-    ///
-    /// Persisted so the id counter can resume above it after a restart instead of
-    /// rewinding to the max surviving notification — a rewind reuses ids that
-    /// long-lived clients still hold, so an action invoked on a new notification
-    /// would reach the wrong, stale client.
-    #[instrument(skip(self), err)]
-    pub fn id_high_water(&self) -> Result<u32, Error> {
-        let conn = self
-            .connection
-            .lock()
-            .map_err(|_| Error::DatabaseError("cannot acquire lock on database".to_string()))?;
-        let value: Option<u32> = conn
-            .query_row(
-                "SELECT value FROM metadata WHERE key = 'id_high_water'",
-                [],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(|err| Error::DatabaseError(format!("cannot read id high-water: {err}")))?;
-        Ok(value.unwrap_or(0))
-    }
-
-    /// Records `id` as issued, advancing the persisted high-water mark if higher.
-    #[instrument(skip(self), err)]
-    pub fn record_id_high_water(&self, id: u32) -> Result<(), Error> {
-        self.connection
-            .lock()
-            .map_err(|_| Error::DatabaseError("cannot acquire lock on database".to_string()))?
-            .execute(
-                "INSERT INTO metadata (key, value) VALUES ('id_high_water', ?1)
-                 ON CONFLICT(key) DO UPDATE SET value = MAX(value, excluded.value)",
-                params![id],
-            )
-            .map_err(|err| Error::DatabaseError(format!("cannot record id high-water: {err}")))?;
         Ok(())
     }
 
-    /// The session bus GUID recorded when notifications were last persisted, if any.
-    ///
-    /// Owner unique names are only meaningful within one session bus lifetime, so a
-    /// mismatch means the persisted owners are stale and must not be directed to.
-    #[instrument(skip(self), err)]
-    pub fn bus_guid(&self) -> Result<Option<String>, Error> {
-        let conn = self
-            .connection
-            .lock()
-            .map_err(|_| Error::DatabaseError("cannot acquire lock on database".to_string()))?;
-        let value: Option<String> = conn
-            .query_row(
-                "SELECT value FROM metadata_text WHERE key = 'bus_guid'",
-                [],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(|err| Error::DatabaseError(format!("cannot read bus guid: {err}")))?;
-        Ok(value)
-    }
-
-    /// Records the current session bus GUID.
-    #[instrument(skip(self), err)]
-    pub fn record_bus_guid(&self, guid: &str) -> Result<(), Error> {
-        self.connection
-            .lock()
-            .map_err(|_| Error::DatabaseError("cannot acquire lock on database".to_string()))?
-            .execute(
-                "INSERT INTO metadata_text (key, value) VALUES ('bus_guid', ?1)
-                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                params![guid],
-            )
-            .map_err(|err| Error::DatabaseError(format!("cannot record bus guid: {err}")))?;
-        Ok(())
-    }
-
-    #[instrument(skip(self, notification), fields(id = notification.id, summary = %notification.summary.get()), err)]
+    #[instrument(skip(self, notification), fields(id = %notification.id), err)]
     pub fn add(&self, notification: &Notification) -> Result<(), Error> {
         let stored = StoredNotification::from(notification);
+        let data = serde_json::to_string(&stored)
+            .map_err(|err| Error::DatabaseError(format!("cannot serialize notification: {err}")))?;
 
-        let actions_json = serde_json::to_string(&stored.actions)
-            .map_err(|err| Error::DatabaseError(format!("cannot serialize actions: {err}")))?;
-
-        let mut hints_for_storage = stored.hints.clone();
-        for key in &IMAGE_DATA_KEYS {
-            hints_for_storage.remove(*key);
-        }
-        let hints_json = serde_json::to_string(&hints_for_storage)
-            .map_err(|err| Error::DatabaseError(format!("cannot serialize hints: {err}")))?;
-
-        let source_json = serialize_source(&stored.source);
+        // Resolve the absolute deadline once, at store time: only a finite `After` timeout expires
+        // from history; every other policy stores NULL and is never reaped. Recomputed on each
+        // upsert, so replacing a notification with a new timeout updates its deadline.
+        let expires_at: Option<i64> = match stored.lifecycle.timeout {
+            Timeout::After(ttl) => Some(stored.received_ms + ttl.as_millis() as i64),
+            _ => None,
+        };
 
         self.connection
             .lock()
             .map_err(|_| Error::DatabaseError("cannot acquire lock on database".to_string()))?
             .execute(
-                "INSERT OR REPLACE INTO notifications
-                 (id, app_name, replaces_id, app_icon, summary, body, actions, hints,
-                 expire_timeout, timestamp, image_path, owner, source)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
-                params![
-                    stored.id,
-                    stored.app_name,
-                    stored.replaces_id,
-                    stored.app_icon,
-                    stored.summary,
-                    stored.body,
-                    actions_json,
-                    hints_json,
-                    stored.expire_timeout,
-                    stored.timestamp,
-                    stored.image_path,
-                    stored.owner,
-                    source_json,
-                ],
+                "INSERT OR REPLACE INTO notifications (id, timestamp, expires_at, data)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![stored.id.get(), stored.received_ms, expires_at, data],
             )
             .map_err(|err| Error::DatabaseError(format!("cannot store notification: {err}")))?;
 
         Ok(())
     }
 
-    #[instrument(skip(self), fields(notification_id = id), err)]
-    pub fn remove(&self, id: u32) -> Result<(), Error> {
+    #[instrument(skip(self), fields(notification_id = %id), err)]
+    pub fn remove(&self, id: NotificationId) -> Result<(), Error> {
         self.connection
             .lock()
             .map_err(|_| Error::DatabaseError("cannot acquire lock on database".to_string()))?
-            .execute("DELETE FROM notifications WHERE id = ?1", params![id])
+            .execute("DELETE FROM notifications WHERE id = ?1", params![id.get()])
             .map_err(|err| Error::DatabaseError(format!("cannot remove notification: {err}")))?;
 
         Ok(())
@@ -427,14 +394,14 @@ impl NotificationStore {
     /// Removes several notifications in a single atomic `DELETE` rather than one statement
     /// per id. The ids are `u32`, so inlining them in the `IN` clause is injection-safe.
     #[instrument(skip(self, ids), fields(count = ids.len()), err)]
-    pub fn remove_many(&self, ids: &[u32]) -> Result<(), Error> {
+    pub fn remove_many(&self, ids: &[NotificationId]) -> Result<(), Error> {
         if ids.is_empty() {
             return Ok(());
         }
 
         let placeholders = ids
             .iter()
-            .map(u32::to_string)
+            .map(|id| id.get().to_string())
             .collect::<Vec<_>>()
             .join(",");
 
@@ -456,98 +423,65 @@ impl NotificationStore {
             .connection
             .lock()
             .map_err(|_| Error::DatabaseError("cannot acquire lock on database".to_string()))?;
-        let mut stmt = conn
-            .prepare(
-                "SELECT id, app_name, replaces_id, app_icon, summary, body,
-                 actions, hints, expire_timeout, timestamp, image_path, owner, source
-                 FROM notifications
-                 ORDER BY timestamp DESC",
-            )
-            .map_err(|err| Error::DatabaseError(format!("cannot prepare query: {err}")))?;
 
-        let notifications = stmt
-            .query_map([], |row| {
-                let actions_json: String = row.get(6)?;
-                let hints_json: String = row.get(7)?;
-                let image_path: Option<String> = row.get(10)?;
-                let source: Option<String> = row.get(12)?;
+        // A single `now` snapshot for both the reap and the survivor query, taken under the held
+        // lock so they are one atomic view: a notification is never both reaped and loaded, nor
+        // dropped by neither. A finite notification that crosses its deadline *after* this
+        // snapshot is still loaded (kept in the store) and later removed through the normal
+        // `Remove` path when monitoring arms its timer — so it is never orphaned in the store.
+        let now_ms = Utc::now().timestamp_millis();
 
-                let actions: Vec<String> =
-                    serde_json::from_str(&actions_json).unwrap_or_else(|err| {
-                        warn!(error = %err, "cannot deserialize actions");
-                        Vec::new()
-                    });
-                let hints_json_map: HashMap<String, serde_json::Value> =
-                    serde_json::from_str(&hints_json).unwrap_or_else(|err| {
-                        warn!(error = %err, "cannot deserialize hints");
-                        HashMap::new()
-                    });
-                let mut hints: HashMap<String, OwnedValue> = hints_json_map
-                    .into_iter()
-                    .filter_map(|(key, value)| {
-                        // `from_value` cannot rebuild string-valued `OwnedValue`s — its
-                        // deserializer needs *borrowed* input — so it silently dropped
-                        // every string hint on reload (desktop-entry, category,
-                        // sound-file, ...). Re-serialize and go through `from_str`, which
-                        // borrows from the JSON text and round-trips correctly.
-                        let json = serde_json::to_string(&value).ok()?;
-                        serde_json::from_str::<OwnedValue>(&json)
-                            .ok()
-                            .map(|owned_value| (key, owned_value))
-                    })
-                    .collect();
-
-                if let Some(ref path) = image_path {
-                    hints.insert(
-                        String::from("image-path"),
-                        OwnedValue::from(Str::from(path.as_str())),
-                    );
-                }
-
-                Ok(StoredNotification {
-                    id: row.get(0)?,
-                    app_name: row.get(1)?,
-                    replaces_id: row.get(2)?,
-                    app_icon: row.get(3)?,
-                    summary: row.get(4)?,
-                    body: row.get(5)?,
-                    actions,
-                    hints,
-                    image_path,
-                    expire_timeout: row.get(8)?,
-                    timestamp: row.get(9)?,
-                    owner: row.get(11)?,
-                    source: deserialize_source(source),
-                })
-            })
-            .map_err(|err| Error::DatabaseError(format!("cannot query notifications: {err}")))?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|err| Error::DatabaseError(format!("cannot parse notifications: {err}")))?;
-
-        if !remove_expired {
-            debug!(count = notifications.len(), "loaded stored notifications");
-            return Ok(notifications);
+        // Reap notifications whose finite deadline elapsed while the daemon was down — the one
+        // expiry no live `Remove` event can cover (no process ran to fire the timer). Every
+        // runtime removal (dismiss / close / clear / expiry-while-running) already deletes at
+        // removal time, so this is the sole reason the store could otherwise grow unbounded.
+        // Plain SQL on the precomputed deadline; NULL `expires_at` never expires. Best-effort:
+        // a failed reap must not fail the load.
+        if remove_expired {
+            match conn.execute(
+                "DELETE FROM notifications WHERE expires_at IS NOT NULL AND expires_at <= ?1",
+                params![now_ms],
+            ) {
+                Ok(count) if count > 0 => debug!(count, "reaped expired notifications from store"),
+                Ok(_) => {}
+                Err(err) => warn!(error = %err, "cannot reap expired notifications from store"),
+            }
         }
 
-        let now = Utc::now();
-        let notifications: Vec<StoredNotification> = notifications
-            .into_iter()
-            .filter(|notif| {
-                let Some(timeout) = notif.expire_timeout else {
-                    return true;
-                };
-                let Some(timestamp) = DateTime::<Utc>::from_timestamp_millis(notif.timestamp)
-                else {
-                    return false;
-                };
-                timestamp + Duration::from_millis(timeout as u64) > now
-            })
-            .collect();
+        // Load the survivors. When reaping, exclude anything already past its deadline in the
+        // SAME `now_ms` snapshot as the DELETE, so an expired-during-downtime notification never
+        // even briefly enters the live list (option (b): no stale flash on startup).
+        let rows: Vec<String> = if remove_expired {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT data FROM notifications
+                     WHERE expires_at IS NULL OR expires_at > ?1
+                     ORDER BY timestamp DESC",
+                )
+                .map_err(|err| Error::DatabaseError(format!("cannot prepare query: {err}")))?;
+            stmt.query_map(params![now_ms], |row| row.get::<_, String>(0))
+                .map_err(|err| Error::DatabaseError(format!("cannot query notifications: {err}")))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|err| Error::DatabaseError(format!("cannot read notifications: {err}")))?
+        } else {
+            let mut stmt = conn
+                .prepare("SELECT data FROM notifications ORDER BY timestamp DESC")
+                .map_err(|err| Error::DatabaseError(format!("cannot prepare query: {err}")))?;
+            stmt.query_map([], |row| row.get::<_, String>(0))
+                .map_err(|err| Error::DatabaseError(format!("cannot query notifications: {err}")))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|err| Error::DatabaseError(format!("cannot read notifications: {err}")))?
+        };
 
-        debug!(
-            count = notifications.len(),
-            "loaded stored notifications (expired filtered)"
-        );
+        let mut notifications = Vec::with_capacity(rows.len());
+        for data in rows {
+            match serde_json::from_str::<StoredNotification>(&data) {
+                Ok(notif) => notifications.push(notif),
+                Err(err) => warn!(error = %err, "cannot deserialize stored notification; skipping"),
+            }
+        }
+
+        debug!(count = notifications.len(), "loaded stored notifications");
         Ok(notifications)
     }
 }
@@ -558,8 +492,87 @@ mod tests {
 
     use super::*;
 
+    /// Test helper mirroring how `add` encodes the dispatch, then how `load_all` decodes it.
+    fn serialize_source(source: &NotificationSource) -> String {
+        serde_json::to_string(&stored_source(source)).expect("serialize source")
+    }
+
+    fn deserialize_source(raw: Option<String>) -> NotificationSource {
+        raw.and_then(|raw| serde_json::from_str::<StoredSource>(&raw).ok())
+            .map(source_from_stored)
+            .unwrap_or_else(|| {
+                NotificationSource::Freedesktop(FreedesktopDispatch {
+                    wire_id: 0,
+                    session_id: String::new(),
+                    owner: None,
+                })
+            })
+    }
+
     fn owned(value: Value<'_>) -> OwnedValue {
         OwnedValue::try_from(value).expect("value converts to OwnedValue")
+    }
+
+    /// An isolated store backed by an in-memory database with the real schema applied.
+    fn in_memory_store() -> NotificationStore {
+        let connection = rusqlite::Connection::open_in_memory().expect("open in-memory database");
+        NotificationStore::configure(&connection).expect("configure schema");
+        NotificationStore {
+            connection: Arc::new(Mutex::new(connection)),
+        }
+    }
+
+    /// Inserts a raw row with a chosen `expires_at`. The `data` blob is intentionally not a valid
+    /// `StoredNotification` — these tests assert the DELETE/SELECT behavior on the `expires_at`
+    /// column, which runs before (and independently of) blob deserialization.
+    fn insert_row(store: &NotificationStore, id: i64, expires_at: Option<i64>) {
+        store
+            .connection
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO notifications (id, timestamp, expires_at, data) VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![id, 0i64, expires_at, "{}"],
+            )
+            .expect("insert row");
+    }
+
+    fn remaining_ids(store: &NotificationStore) -> Vec<i64> {
+        let conn = store.connection.lock().unwrap();
+        let mut stmt = conn
+            .prepare("SELECT id FROM notifications ORDER BY id")
+            .expect("prepare");
+        stmt.query_map([], |row| row.get::<_, i64>(0))
+            .expect("query")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect")
+    }
+
+    #[test]
+    fn load_all_reaps_only_elapsed_finite_deadlines() {
+        let store = in_memory_store();
+        let now = Utc::now().timestamp_millis();
+        insert_row(&store, 1, Some(now - 1_000)); // finite, elapsed → reaped
+        insert_row(&store, 2, Some(now + 60_000)); // finite, still live → kept
+        insert_row(&store, 3, None); // never expires → kept
+
+        store.load_all(true).expect("load");
+
+        // The elapsed row is DELETED from the DB (bounded growth), not merely filtered from the
+        // returned set; live and never-expire rows remain.
+        assert_eq!(remaining_ids(&store), vec![2, 3]);
+    }
+
+    #[test]
+    fn load_all_without_reaping_keeps_every_row() {
+        let store = in_memory_store();
+        let now = Utc::now().timestamp_millis();
+        insert_row(&store, 1, Some(now - 1_000)); // elapsed, but reaping is off
+        insert_row(&store, 2, None);
+
+        store.load_all(false).expect("load");
+
+        assert_eq!(remaining_ids(&store), vec![1, 2]);
     }
 
     #[test]
@@ -836,50 +849,71 @@ mod tests {
         assert!(restored.target.is_none());
     }
 
-    /// Serialize hints as `add()` does, then rebuild them as `load_all` does.
-    fn roundtrip(hints: &HashMap<String, OwnedValue>) -> HashMap<String, OwnedValue> {
-        let json = serde_json::to_string(hints).expect("serialize hints");
-        let value_map: HashMap<String, serde_json::Value> =
-            serde_json::from_str(&json).expect("parse hints json");
-        value_map
-            .into_iter()
-            .filter_map(|(key, value)| {
-                let json = serde_json::to_string(&value).ok()?;
-                serde_json::from_str::<OwnedValue>(&json)
-                    .ok()
-                    .map(|owned| (key, owned))
-            })
-            .collect()
-    }
-
-    /// Regression guard: string-valued hints must survive the store→load JSON
-    /// round-trip. `serde_json::from_value::<OwnedValue>` used to drop them
-    /// (needs borrowed input), which silently lost `desktop-entry` on reload.
     #[test]
-    fn string_hint_survives_roundtrip() {
-        let mut hints: HashMap<String, OwnedValue> = HashMap::new();
-        hints.insert(
-            String::from("desktop-entry"),
-            OwnedValue::from(Str::from("org.gnome.clocks")),
+    fn source_round_trips_portal_dispatch_with_target() {
+        let mut button_actions = HashMap::new();
+        button_actions.insert(
+            String::from("app.reply"),
+            PortalAction {
+                // Portal keeps the raw (unstripped) action name.
+                name: String::from("app.reply"),
+                target: Some(OwnedValue::try_from(Value::new((5u8, vec![1u8, 2, 3]))).unwrap()),
+                purpose: Some(ButtonPurpose::SystemCustomAlert),
+            },
         );
+        let source = NotificationSource::Portal(PortalDispatch {
+            app_id: String::from("de.schmidhuberj.Flare"),
+            portal_id: String::from("msg-1"),
+            default_action: Some(PortalAction {
+                name: String::from("app.show"),
+                target: None,
+                purpose: None,
+            }),
+            button_actions,
+            reply_action: Some(PortalAction {
+                name: String::from("app.inline-reply"),
+                target: Some(OwnedValue::from(Str::from("thread-1"))),
+                purpose: Some(ButtonPurpose::ImReplyWithText),
+            }),
+        });
 
-        let loaded = roundtrip(&hints);
+        let restored = deserialize_source(Some(serialize_source(&source)));
 
-        let desktop_entry = loaded
-            .get("desktop-entry")
-            .and_then(|hint| hint.downcast_ref::<String>().ok());
-        assert_eq!(desktop_entry.as_deref(), Some("org.gnome.clocks"));
+        let NotificationSource::Portal(dispatch) = restored else {
+            panic!("expected a portal source");
+        };
+        assert_eq!(dispatch.app_id, "de.schmidhuberj.Flare");
+        assert_eq!(dispatch.portal_id, "msg-1");
+        let default = dispatch.default_action.expect("default action preserved");
+        assert_eq!(default.name, "app.show");
+        assert!(default.target.is_none());
+        let reply = dispatch
+            .button_actions
+            .get("app.reply")
+            .expect("button action preserved");
+        assert_eq!(reply.name, "app.reply");
+        let target = reply.target.as_ref().expect("structured target preserved");
+        assert_eq!(target.value_signature().to_string(), "(yay)");
+        assert_eq!(reply.purpose, Some(ButtonPurpose::SystemCustomAlert));
+        // The inline-reply action round-trips too (target + purpose).
+        let reply_action = dispatch.reply_action.expect("reply action preserved");
+        assert_eq!(reply_action.name, "app.inline-reply");
+        assert_eq!(
+            reply_action.target.unwrap().downcast_ref::<String>().unwrap(),
+            "thread-1"
+        );
+        assert_eq!(reply_action.purpose, Some(ButtonPurpose::ImReplyWithText));
     }
 
     #[test]
     fn source_absent_or_unknown_defaults_to_freedesktop() {
         assert!(matches!(
             deserialize_source(None),
-            NotificationSource::Freedesktop
+            NotificationSource::Freedesktop(_)
         ));
         assert!(matches!(
             deserialize_source(Some(String::from("garbage"))),
-            NotificationSource::Freedesktop
+            NotificationSource::Freedesktop(_)
         ));
     }
 }
