@@ -14,6 +14,7 @@ members = [
     "wayle-network",
     "wayle-niri",
     "wayle-notification",
+    "wayle-portal",
     "wayle-power-profiles",
     "wayle-sysinfo",
     "wayle-systray",
