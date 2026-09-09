@@ -314,7 +314,19 @@ fn retract_player(ctx: &MonitoringContext, player_id: &PlayerId) {
     }
 }
 
+/// Bus name of `playerctld`, the playerctl project's player-mirroring daemon.
+/// Only a proxy to other media players — it mirrors the most recently active
+/// one verbatim, `Identity` included, so listing it would show that player
+/// twice under the same name. Always ignored, like KDE's MPRIS handling does.
+/// It can still be addressed explicitly via
+/// [`MediaService::player_monitored`](crate::MediaService::player_monitored).
+const PLAYERCTLD_BUS_NAME: &str = "org.mpris.MediaPlayer2.playerctld";
+
 fn should_ignore(bus_name: &str, ignored_patterns: &[String]) -> bool {
+    if bus_name == PLAYERCTLD_BUS_NAME {
+        return true;
+    }
+
     ignored_patterns
         .iter()
         .any(|pattern| bus_name.contains(pattern))
@@ -354,5 +366,10 @@ mod tests {
         let bus_name = "org.mpris.MediaPlayer2.chromium.instance123";
 
         assert!(should_ignore(bus_name, &patterns));
+    }
+
+    #[test]
+    fn should_ignore_always_ignores_playerctld() {
+        assert!(should_ignore("org.mpris.MediaPlayer2.playerctld", &[]));
     }
 }
