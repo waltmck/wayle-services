@@ -5,64 +5,166 @@
 //! representation (string `Station.State`, string `Network.Type`,
 //! `100 x dBm` signal strength) instead of NetworkManager's.
 
-/// Connection-attempt-aware view of what the station is doing with respect to a
-/// specific network — the single reactive state model for the "active
-/// connection" UI.
-///
-/// IWD's raw `net.connman.iwd.Station.State` does not name the *target* of an
-/// in-progress attempt (during a transition `Station.ConnectedNetwork` may still
-/// point at the previous network), and reports no failure as a state. This type
-/// augments the raw state with the target SSID. It is purely the positive state;
-/// a failed attempt is surfaced via the `Result` returned by
-/// [`Station::connect`](crate::Station::connect), not held here.
+use std::sync::Arc;
+
+use crate::{Error, Network};
+
+/// What a station is doing, and with which network: IWD's `Station.State`,
+/// with its `ConnectedNetwork`, which IWD sets as soon as a connection starts.
+/// A failed connection isn't a state; it is recorded in
+/// [`Station::last_error`](crate::Station::last_error).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum ConnectionState {
     /// Not connected and not attempting a connection.
     #[default]
     Idle,
-    /// Establishing (or roaming to) a connection to `ssid`.
+    /// Establishing a connection to `network`.
     Connecting {
-        /// SSID being connected to.
-        ssid: String,
+        /// The network being connected to.
+        network: Arc<Network>,
     },
-    /// Connected to `ssid`.
+    /// Connected to `network`.
     Connected {
-        /// SSID currently connected to.
-        ssid: String,
+        /// The network connected to.
+        network: Arc<Network>,
     },
-    /// Connected to `ssid` but roaming between access points. Treated as an
+    /// Connected to `network` but roaming between access points. Treated as an
     /// active connection (signal strength stays meaningful); the UI may label it
     /// distinctly from [`Connected`](Self::Connected).
     Roaming {
-        /// SSID currently connected to.
-        ssid: String,
+        /// The network connected to.
+        network: Arc<Network>,
     },
 }
 
 impl ConnectionState {
     /// Derives a connection state from IWD's raw `Station.State` string
     /// (`connected` / `connecting` / `disconnecting` / `disconnected` /
-    /// `roaming`) and the resolved `ConnectedNetwork` SSID. Only the terminal
+    /// `roaming`) and its `ConnectedNetwork`. Only the terminal
     /// `disconnected`/`disconnecting` clear to `Idle`.
-    pub(crate) fn from_raw_state(state: &str, connected_ssid: Option<String>) -> Self {
+    pub(crate) fn from_raw_state(state: &str, connected: Option<Arc<Network>>) -> Self {
         match state {
-            "connected" => connected_ssid.map_or(Self::Idle, |ssid| Self::Connected { ssid }),
-            "roaming" => connected_ssid.map_or(Self::Idle, |ssid| Self::Roaming { ssid }),
-            "connecting" => connected_ssid.map_or(Self::Idle, |ssid| Self::Connecting { ssid }),
+            "connected" => connected.map_or(Self::Idle, |network| Self::Connected { network }),
+            "roaming" => connected.map_or(Self::Idle, |network| Self::Roaming { network }),
+            "connecting" => connected.map_or(Self::Idle, |network| Self::Connecting { network }),
             _ => Self::Idle,
         }
     }
 
-    /// The SSID of the active or in-progress connection, if any.
-    pub fn ssid(&self) -> Option<&str> {
+    /// The network of the active or in-progress connection, if any.
+    pub fn network(&self) -> Option<&Arc<Network>> {
         match self {
             Self::Idle => None,
-            Self::Connecting { ssid } | Self::Connected { ssid } | Self::Roaming { ssid } => {
-                Some(ssid)
-            }
+            Self::Connecting { network }
+            | Self::Connected { network }
+            | Self::Roaming { network } => Some(network),
         }
     }
 }
+
+/// A request a station was asked to make.
+#[derive(Clone, PartialEq, Eq)]
+pub enum StationAction {
+    /// [`Network::connect`](crate::Network::connect) to `network`.
+    Connect {
+        /// The network connected to.
+        network: Arc<Network>,
+    },
+    /// [`Station::disconnect`](crate::Station::disconnect).
+    Disconnect,
+    /// [`Station::scan`](crate::Station::scan).
+    Scan,
+    /// [`Station::set_powered`](crate::Station::set_powered).
+    SetPowered,
+    /// [`Network::forget`](crate::Network::forget) `network`.
+    Forget {
+        /// The network forgotten.
+        network: Arc<Network>,
+    },
+}
+
+/// Names the network by SSID and object path rather than dumping all of its
+/// state, as this appears in logs.
+impl std::fmt::Debug for StationAction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let network = |name: &str, network: &Network, f: &mut std::fmt::Formatter<'_>| {
+            f.debug_struct(name)
+                .field("ssid", &network.ssid.get())
+                .field("path", &network.object_path().as_str())
+                .finish()
+        };
+        match self {
+            Self::Connect { network: target } => network("Connect", target, f),
+            Self::Forget { network: target } => network("Forget", target, f),
+            Self::Disconnect => f.write_str("Disconnect"),
+            Self::Scan => f.write_str("Scan"),
+            Self::SetPowered => f.write_str("SetPowered"),
+        }
+    }
+}
+
+/// A request to IWD that failed.
+///
+/// IWD reports a failed request only in its error reply, so the service
+/// records the most recent one on the station, where every consumer sees it.
+#[derive(Debug, Clone)]
+pub struct StationError {
+    /// The request that failed.
+    pub action: StationAction,
+    /// The complete error, e.g. a [`zbus::Error::MethodError`] carrying IWD's
+    /// error name (`net.connman.iwd.Failed`, `net.connman.iwd.Timeout`, ...).
+    pub error: Arc<Error>,
+}
+
+impl StationError {
+    pub(crate) fn new(action: StationAction, error: Error) -> Self {
+        Self {
+            action,
+            error: Arc::new(error),
+        }
+    }
+
+    /// Whether this is IWD refusing to turn WiFi on because a hardware switch
+    /// (or the firmware) blocks the radio, which software can't lift. IWD
+    /// reports a hardware block only this way, and not its end: the error
+    /// stays until the next request, after the switch may have been flipped
+    /// back.
+    pub fn hardware_blocked(&self) -> bool {
+        self.action == StationAction::SetPowered
+            && self.error.is_iwd_error(crate::error::IWD_NOT_AVAILABLE)
+    }
+}
+
+/// Two errors are equal only if they are the same recorded failure, so a new
+/// failure is always seen as a change.
+impl PartialEq for StationError {
+    fn eq(&self, other: &Self) -> bool {
+        self.action == other.action && Arc::ptr_eq(&self.error, &other.error)
+    }
+}
+
+impl Eq for StationError {}
+
+/// A passphrase IWD asks this service's agent for, to connect to `network`.
+/// Answer it with [`IwdService::provide_passphrase`](crate::IwdService::provide_passphrase)
+/// or turn it down with [`IwdService::cancel_passphrase_request`](crate::IwdService::cancel_passphrase_request).
+#[derive(Debug, Clone)]
+pub struct PassphraseRequest {
+    /// The network being connected to.
+    pub network: Arc<Network>,
+    /// Whether IWD asks again because connecting with the passphrase this
+    /// service last gave it for this network failed. IWD doesn't say why: the
+    /// passphrase may be wrong, or the network may have dropped out meanwhile.
+    pub rejected: bool,
+}
+
+impl PartialEq for PassphraseRequest {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.network, &other.network) && self.rejected == other.rejected
+    }
+}
+
+impl Eq for PassphraseRequest {}
 
 /// Security type classification for a network.
 ///
@@ -104,7 +206,7 @@ impl SecurityType {
 pub(crate) const SIGNAL_STRENGTH_THRESHOLDS: [i16; 4] = [-60, -67, -74, -81];
 
 /// Signal strength as a discrete bucket (weakest to strongest), partitioned by
-/// [`SIGNAL_STRENGTH_THRESHOLDS`]. Exposed instead of a raw percentage because
+/// the dBm thresholds `-60`, `-67`, `-74` and `-81` (iwgtk's levels). Exposed instead of a raw percentage because
 /// IWD's `SignalLevelAgent` reports a bucketed level, and the UI only renders
 /// per-bucket icons.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
@@ -146,8 +248,9 @@ impl SignalStrength {
     }
 
     /// Buckets a plain-dBm RSSI value (e.g. from `GetDiagnostics`, or a
-    /// `GetOrderedNetworks` value already divided by 100).
-    pub(crate) fn from_dbm(dbm: i16) -> Self {
+    /// `GetOrderedNetworks` value already divided by 100, as
+    /// [`Network::signal`](crate::Network::signal) is).
+    pub fn from_dbm(dbm: i16) -> Self {
         let index = SIGNAL_STRENGTH_THRESHOLDS
             .iter()
             .filter(|&&threshold| dbm >= threshold)
@@ -181,24 +284,44 @@ mod tests {
 
     #[test]
     fn connection_state_from_raw_state() {
-        let net = || Some(String::from("net"));
+        let (commands, _) = crate::dispatcher::command::Commands::channel();
+        let network = Arc::new(Network::new(
+            &commands,
+            zbus::zvariant::OwnedObjectPath::try_from("/net/connman/iwd/0/4/6e6574_psk").unwrap(),
+        ));
+        let net = || Some(Arc::clone(&network));
         assert_eq!(
             ConnectionState::from_raw_state("connected", net()),
-            ConnectionState::Connected { ssid: "net".into() }
+            ConnectionState::Connected {
+                network: net().unwrap()
+            }
         );
-        // Roaming is its own state, still carrying the SSID.
+        // Roaming is its own state, still carrying the network.
         assert_eq!(
             ConnectionState::from_raw_state("roaming", net()),
-            ConnectionState::Roaming { ssid: "net".into() }
+            ConnectionState::Roaming {
+                network: net().unwrap()
+            }
         );
         assert_eq!(
             ConnectionState::from_raw_state("connecting", net()),
-            ConnectionState::Connecting { ssid: "net".into() }
+            ConnectionState::Connecting {
+                network: net().unwrap()
+            }
         );
         // Disconnecting/disconnected/unknown collapse to Idle.
-        assert_eq!(ConnectionState::from_raw_state("disconnecting", net()), ConnectionState::Idle);
-        assert_eq!(ConnectionState::from_raw_state("disconnected", None), ConnectionState::Idle);
-        assert_eq!(ConnectionState::from_raw_state("connected", None), ConnectionState::Idle);
+        assert_eq!(
+            ConnectionState::from_raw_state("disconnecting", net()),
+            ConnectionState::Idle
+        );
+        assert_eq!(
+            ConnectionState::from_raw_state("disconnected", None),
+            ConnectionState::Idle
+        );
+        assert_eq!(
+            ConnectionState::from_raw_state("connected", None),
+            ConnectionState::Idle
+        );
     }
 
     #[test]
@@ -206,7 +329,10 @@ mod tests {
         assert_eq!(SecurityType::from_iwd_type("open"), SecurityType::None);
         assert_eq!(SecurityType::from_iwd_type("wep"), SecurityType::Wep);
         assert_eq!(SecurityType::from_iwd_type("psk"), SecurityType::Psk);
-        assert_eq!(SecurityType::from_iwd_type("8021x"), SecurityType::Enterprise);
+        assert_eq!(
+            SecurityType::from_iwd_type("8021x"),
+            SecurityType::Enterprise
+        );
         assert_eq!(SecurityType::from_iwd_type("other"), SecurityType::None);
     }
 
