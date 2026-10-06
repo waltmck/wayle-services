@@ -3739,11 +3739,9 @@ dependencies = [
  "futures",
  "thiserror 2.0.18",
  "tokio",
- "tokio-stream",
  "tokio-util",
  "tracing",
  "wayle-core",
- "wayle-traits",
  "zbus",
 ]
 

@@ -1,151 +1,89 @@
-//! Top-level IWD service.
+//! The IWD service.
 
 use std::sync::Arc;
 
 use derive_more::Debug;
 use tokio_util::sync::CancellationToken;
-use tracing::{instrument, warn};
 use wayle_core::Property;
-use wayle_traits::{Reactive, ServiceMonitoring};
-use zbus::{Connection, zvariant::OwnedObjectPath};
 
 use crate::{
-    agent::{AGENT_PATH, Agent, PassphraseStore},
-    discovery::IwdDiscovery,
+    dispatcher::{
+        self, Handle, Published,
+        command::{Command, Commands},
+    },
     error::Error,
-    proxy::agent_manager::AgentManagerProxy,
-    station::{LiveStationParams, Station},
+    station::Station,
+    types::PassphraseRequest,
 };
 
-/// Entry point for WiFi management via IWD.
+/// WiFi management via IWD (`net.connman.iwd`).
 ///
-/// Mirrors the WiFi surface of `wayle-network`'s `NetworkService`, but is
-/// WiFi-only (IWD does not manage wired connections or IP configuration).
+/// State comes from IWD, published as reactive properties and kept in sync by
+/// one background dispatcher, the only thing that changes it, so it reflects
+/// changes made by any client (e.g. `iwctl`). Actions return nothing: they are
+/// queued to the dispatcher, which sends them to IWD in call order, and their
+/// outcome shows up as state.
 #[derive(Debug)]
 pub struct IwdService {
     #[debug(skip)]
-    pub(crate) zbus_connection: Connection,
+    commands: Commands,
     #[debug(skip)]
-    pub(crate) cancellation_token: CancellationToken,
-    #[debug(skip)]
-    pub(crate) passphrases: Arc<PassphraseStore>,
-    /// WiFi station, if a device is present (live-updated on hot-plug).
+    cancellation_token: CancellationToken,
+    /// The WiFi station, while IWD has a device (live).
     pub station: Property<Option<Arc<Station>>>,
+    /// The passphrase IWD is waiting for, while it waits: IWD asks this
+    /// service's agent when it connects to a secured network it has no
+    /// passphrase saved for.
+    pub passphrase_request: Property<Option<PassphraseRequest>>,
 }
 
 impl IwdService {
-    /// Connect to IWD, register the passphrase agent, discover the station
-    /// device, and begin monitoring.
+    /// Connects to the system bus and, if IWD is running, enumerates its
+    /// devices and networks and registers the passphrase agent. A background
+    /// dispatcher then keeps the service in sync, including across IWD
+    /// restarts; if IWD isn't running, the service starts empty and fills in
+    /// once IWD appears.
+    ///
+    /// Must be called within a Tokio runtime, which runs the dispatcher.
     ///
     /// # Errors
-    /// Returns [`Error::ServiceInitializationFailed`] if the D-Bus connection
-    /// or agent registration cannot be established.
-    #[instrument]
+    /// Returns error if the system bus connection fails.
     pub async fn new() -> Result<Self, Error> {
-        let connection = Connection::system().await.map_err(|err| {
-            Error::ServiceInitializationFailed(format!("D-Bus connection failed: {err}"))
-        })?;
-
-        let cancellation_token = CancellationToken::new();
-        let passphrases = Arc::new(PassphraseStore::default());
-
-        register_agent(&connection, passphrases.clone()).await?;
-
-        let station = match IwdDiscovery::device_path(&connection).await? {
-            Some(path) => {
-                build_station(&connection, path, &cancellation_token, passphrases.clone()).await
-            }
-            None => None,
-        };
-
-        let service = Self {
-            zbus_connection: connection,
+        let Handle {
+            published,
+            commands,
             cancellation_token,
-            passphrases,
-            station: Property::new(station),
-        };
+        } = dispatcher::start().await?;
+        let Published {
+            station,
+            passphrase_request,
+        } = published;
 
-        service.start_monitoring().await?;
+        Ok(Self {
+            commands,
+            cancellation_token,
+            station,
+            passphrase_request,
+        })
+    }
 
-        Ok(service)
+    /// Answers the pending [`passphrase_request`](Self::passphrase_request).
+    /// If IWD rejects the passphrase, it asks again (see
+    /// [`PassphraseRequest::rejected`]). Ignored (and logged) if IWD isn't
+    /// asking.
+    pub fn provide_passphrase(&self, passphrase: String) {
+        self.commands.send(Command::ProvidePassphrase(passphrase));
+    }
+
+    /// Turns the pending [`passphrase_request`](Self::passphrase_request)
+    /// down, which ends the connection attempt (not recorded as a failure).
+    pub fn cancel_passphrase_request(&self) {
+        self.commands.send(Command::CancelPassphrase);
     }
 }
 
 impl Drop for IwdService {
     fn drop(&mut self) {
         self.cancellation_token.cancel();
-    }
-}
-
-/// Serve our passphrase [`Agent`] object and register it with IWD.
-async fn register_agent(
-    connection: &Connection,
-    passphrases: Arc<PassphraseStore>,
-) -> Result<(), Error> {
-    let agent_path = zbus::zvariant::ObjectPath::try_from(AGENT_PATH).map_err(|err| {
-        Error::ServiceInitializationFailed(format!("invalid agent path: {err}"))
-    })?;
-
-    connection
-        .object_server()
-        .at(agent_path, Agent::new(passphrases))
-        .await
-        .map_err(Error::DbusError)?;
-
-    register_agent_with_iwd(connection).await;
-
-    Ok(())
-}
-
-/// (Re)register the already-served passphrase agent with IWD's `AgentManager`.
-///
-/// IWD's record of a registered agent is per-daemon-instance and is lost when
-/// IWD restarts, so this must be re-issued whenever IWD re-appears on the bus
-/// (mirroring iwgtk's per-`iwd_up` `agent_register`). Only the IWD-facing
-/// registration is repeated — the served object persists across an IWD restart,
-/// so it is not (and must not be) re-served. Best-effort: a failure is logged and
-/// passphrase prompts are simply unavailable until the next attempt.
-pub(crate) async fn register_agent_with_iwd(connection: &Connection) {
-    let agent_path = match zbus::zvariant::ObjectPath::try_from(AGENT_PATH) {
-        Ok(path) => path,
-        Err(err) => {
-            warn!(error = %err, "invalid iwd agent path; cannot register agent");
-            return;
-        }
-    };
-
-    let manager = match AgentManagerProxy::new(connection).await {
-        Ok(manager) => manager,
-        Err(err) => {
-            warn!(error = %err, "cannot reach iwd AgentManager; passphrase prompts may be unavailable");
-            return;
-        }
-    };
-
-    if let Err(err) = manager.register_agent(&agent_path).await {
-        warn!(error = %err, "cannot register iwd agent; passphrase prompts may be unavailable");
-    }
-}
-
-/// Build a live [`Station`], logging and returning `None` on failure.
-pub(crate) async fn build_station(
-    connection: &Connection,
-    path: OwnedObjectPath,
-    cancellation_token: &CancellationToken,
-    passphrases: Arc<PassphraseStore>,
-) -> Option<Arc<Station>> {
-    match Station::get_live(LiveStationParams {
-        connection,
-        device_path: path.clone(),
-        cancellation_token,
-        passphrases,
-    })
-    .await
-    {
-        Ok(station) => Some(station),
-        Err(err) => {
-            warn!(error = %err, path = %path, "cannot create iwd station");
-            None
-        }
     }
 }
